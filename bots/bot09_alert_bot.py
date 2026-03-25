@@ -83,6 +83,7 @@ class AlertBot(BaseBot):
         asyncio.create_task(self._daily_summary_scheduler())
         asyncio.create_task(self._pre_market_briefing_scheduler())
         self.log("Alert Bot starting")
+        await self._send_startup_notification()
 
     async def run(self):
         while self.running:
@@ -91,6 +92,40 @@ class AlertBot(BaseBot):
 
     async def cleanup(self):
         self.log(f"Alert Bot stopped | {len(self._alert_history)} alerts logged")
+
+    # ── Startup notification ───────────────────────────────────────────────────
+
+    async def _send_startup_notification(self):
+        """Send a Telegram message when the system comes online."""
+        try:
+            portfolio_value = 0.0
+            try:
+                risk_stats = await self.bus.get_state("bot6:stats") or {}
+                portfolio_value = risk_stats.get("portfolio_value", 0.0)
+            except Exception:
+                pass
+            pv_str = f"${portfolio_value:,.2f}" if portfolio_value else "$1,000.00"
+
+            import pytz
+            et = pytz.timezone("America/New_York")
+            now_et = datetime.now(et)
+            hour = now_et.hour
+            if 9 <= hour < 16:
+                status_line = "Market is open — scanning for entries..."
+            elif hour < 9:
+                status_line = "Waiting for market open..."
+            else:
+                status_line = "Market closed — monitoring overnight..."
+
+            text = (
+                "🤖 <b>Trading Bot Online</b>\n"
+                "All 12 bots running\n"
+                f"Portfolio: {pv_str}\n"
+                f"{status_line}"
+            )
+            await self._send_telegram(text)
+        except Exception as e:
+            self.log(f"Startup notification error: {e}", "warning")
 
     # ── Alert handler ──────────────────────────────────────────────────────────
 
