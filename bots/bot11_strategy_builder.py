@@ -71,7 +71,7 @@ class StrategyBuilder(BaseBot):
         import pytz
         et     = pytz.timezone("America/New_York")
         now    = datetime.now(et)
-        target = now.replace(hour=23, minute=0, second=0, microsecond=0)
+        target = now.replace(hour=1, minute=0, second=0, microsecond=0)
         if now >= target:
             target += timedelta(days=1)
         wait = (target - now).total_seconds()

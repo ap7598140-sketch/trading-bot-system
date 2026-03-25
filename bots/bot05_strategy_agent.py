@@ -10,7 +10,7 @@ Role   : The brain that synthesises ALL input signals into concrete trade setups
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import anthropic
@@ -19,8 +19,7 @@ from config import Models, RedisConfig, RiskConfig, AnthropicConfig
 from shared.base_bot import BaseBot
 
 
-# How long to accumulate signals before generating a strategy decision
-DECISION_INTERVAL = 90   # seconds
+DECISION_DEBOUNCE = 120  # min seconds between decision cycles (2 min)
 
 
 class StrategyAgent(BaseBot):
@@ -41,6 +40,7 @@ class StrategyAgent(BaseBot):
         self._news_signals: list[dict]       = []
         self._momentum_signals: list[dict]   = []
         self._options_signals: list[dict]    = []
+        self._last_decision: datetime | None = None  # debounce for event-driven cycles
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -53,12 +53,9 @@ class StrategyAgent(BaseBot):
         self.log("Strategy Agent starting")
 
     async def run(self):
+        # Keep alive; decisions fire event-driven from _on_market_data
         while self.running:
-            await asyncio.sleep(DECISION_INTERVAL)
-            try:
-                await self._decision_cycle()
-            except Exception as e:
-                self.log(f"Decision cycle error: {e}", "error")
+            await asyncio.sleep(3600)
 
     async def cleanup(self):
         self.log("Strategy Agent stopped")
@@ -69,6 +66,15 @@ class StrategyAgent(BaseBot):
         sym = data.get("symbol")
         if sym:
             self._market_data[sym] = data
+        # Trigger a decision cycle at most once per DECISION_DEBOUNCE seconds
+        now = datetime.now(timezone.utc)
+        if (self._last_decision is None or
+                (now - self._last_decision).total_seconds() >= DECISION_DEBOUNCE):
+            self._last_decision = now
+            try:
+                await self._decision_cycle()
+            except Exception as e:
+                self.log(f"Decision cycle error: {e}", "error")
 
     async def _on_news(self, data: dict):
         if data.get("sentiment") != "neutral":

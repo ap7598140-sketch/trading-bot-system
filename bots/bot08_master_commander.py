@@ -23,7 +23,7 @@ from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 
 
-COMMAND_INTERVAL  = 30    # seconds between commander reviews
+COMMAND_INTERVAL  = 120   # seconds between commander reviews (2 min)
 HEARTBEAT_TIMEOUT = 90    # seconds before a bot is considered dead
 MARKET_TZ         = pytz.timezone("America/New_York")
 

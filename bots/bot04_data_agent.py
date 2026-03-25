@@ -188,6 +188,7 @@ class DataAgent(BaseBot):
         self.client  = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
         self.symbols = list(dict.fromkeys(UniverseConfig.WATCHLIST))   # deduplicated
         self._bar_cache: dict[str, list[dict]] = {}   # rolling bar history
+        self._last_ai_scan: datetime | None = None   # throttle AI scan to 10-min intervals
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -249,8 +250,13 @@ class DataAgent(BaseBot):
             except Exception as e:
                 self.log(f"Packet build failed for {sym}: {e}", "warning")
 
-        # 4. AI anomaly scan (Haiku – cheap)
-        anomalies = await self._ai_anomaly_scan(packets)
+        # 4. AI anomaly scan — throttled to once every 10 minutes
+        now = datetime.utcnow()
+        if self._last_ai_scan is None or (now - self._last_ai_scan).total_seconds() >= 600:
+            anomalies = await self._ai_anomaly_scan(packets)
+            self._last_ai_scan = now
+        else:
+            anomalies = {}
 
         # 5. Publish to bus
         for packet in packets:

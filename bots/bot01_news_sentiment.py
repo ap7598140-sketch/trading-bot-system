@@ -19,7 +19,7 @@ from config import Models, RedisConfig, UniverseConfig, AnthropicConfig, AlertCo
 from shared.base_bot import BaseBot
 
 
-POLL_INTERVAL = 120   # seconds between news fetches
+POLL_INTERVAL = 600   # seconds between news fetches (10 min)
 
 
 class NewsSentimentBot(BaseBot):

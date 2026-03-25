@@ -71,8 +71,8 @@ class UniverseConfig:
         "META", "TSLA", "SPY",  "QQQ",  "AMD",
         "NFLX", "AAPL", "JPM",  "BAC",  "GS",
     ]
-    SCAN_INTERVAL_SECONDS = 60   # how often momentum scanner runs
-    DATA_REFRESH_SECONDS  = 30   # how often data agent refreshes
+    SCAN_INTERVAL_SECONDS = 300  # how often momentum scanner runs (5 min)
+    DATA_REFRESH_SECONDS  = 120  # how often data agent refreshes (2 min)
 
 
 # ── Paths ──────────────────────────────────────────────────────────────────────

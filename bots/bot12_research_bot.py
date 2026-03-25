@@ -60,8 +60,8 @@ class ResearchBot(BaseBot):
         import pytz
         et     = pytz.timezone("America/New_York")
         now    = datetime.now(et)
-        # Run at 10 PM ET
-        target = now.replace(hour=22, minute=0, second=0, microsecond=0)
+        # Run at 2 AM ET
+        target = now.replace(hour=2, minute=0, second=0, microsecond=0)
         if now >= target:
             target += timedelta(days=1)
         wait = (target - now).total_seconds()

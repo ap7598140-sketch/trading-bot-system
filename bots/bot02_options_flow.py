@@ -19,7 +19,7 @@ from config import Models, RedisConfig, UniverseConfig, AnthropicConfig, AlpacaC
 from shared.base_bot import BaseBot
 
 
-POLL_INTERVAL    = 60    # seconds between options scans
+POLL_INTERVAL    = 3600  # seconds between options scans (60 min)
 SWEEP_THRESHOLD  = 500   # contracts for a "large" sweep
 OI_CHANGE_THRESH = 0.20  # 20% OI change = unusual
 
