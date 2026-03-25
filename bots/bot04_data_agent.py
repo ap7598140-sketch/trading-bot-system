@@ -11,6 +11,7 @@ Role   : The market data backbone.
 
 import asyncio
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -308,12 +309,21 @@ class DataAgent(BaseBot):
                 ),
             )
             raw = response.content[0].text.strip()
-            # Extract JSON even if model adds markdown fences
-            if "```" in raw:
-                raw = raw.split("```")[1].lstrip("json").strip()
-            parsed  = json.loads(raw)
+            # Strip markdown code fences
+            raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
+            raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
+            # Extract first {...} block in case of extra prose
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            raw = m.group(0) if m else raw
+            # Remove trailing commas before ] or }
+            raw = re.sub(r",\s*([}\]])", r"\1", raw)
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as e:
+                self.log(f"AI anomaly scan JSON parse failed: {e}", "warning")
+                return {}
             flagged = parsed.get("flagged", [])
-            return {item["symbol"]: item for item in flagged}
+            return {item["symbol"]: item for item in flagged if "symbol" in item}
         except Exception as e:
             self.log(f"AI anomaly scan error: {e}", "warning")
             return {}
