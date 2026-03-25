@@ -184,7 +184,7 @@ class AlertBot(BaseBot):
     # ── Slack ──────────────────────────────────────────────────────────────────
 
     async def _send_slack(self, message: str, severity: str):
-        if not AlertConfig.SLACK_WEBHOOK:
+        if not AlertConfig.SLACK_WEBHOOK or not AlertConfig.SLACK_WEBHOOK.startswith("http"):
             return
         emoji = {"critical": "🚨", "error": "❌", "warning": "⚠️", "info": "ℹ️"}.get(severity, "")
         payload = {

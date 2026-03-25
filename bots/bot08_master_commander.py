@@ -121,11 +121,12 @@ class MasterCommander(BaseBot):
     async def _on_alert(self, data: dict):
         alert_type = data.get("type", "")
 
-        # Critical alerts that may require immediate action
+        # Critical alerts that may require immediate action — guard against repeat triggers
         if alert_type in ("daily_loss_halt", "execution_halted"):
-            self._system_halted = True
-            self.log(f"System halt triggered: {alert_type}", "critical")
-            await self._emergency_halt(data.get("reason", alert_type))
+            if not self._system_halted:
+                self._system_halted = True
+                self.log(f"System halt triggered: {alert_type}", "critical")
+                await self._emergency_halt(data.get("reason", alert_type))
 
         elif alert_type == "stop_loss_triggered":
             sym = data.get("symbol")
@@ -313,8 +314,8 @@ class MasterCommander(BaseBot):
             "news":            self._news_summary,
         }
 
-        # AI review (only during market hours to save API calls)
-        if self._market_session in ("open", "pre_market"):
+        # AI review (only during market_open to save API calls and prevent pre-market halts)
+        if self._market_session == "open":
             decision = await self._ai_command_review(system_state)
 
             # Apply AI commands
