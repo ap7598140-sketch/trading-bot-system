@@ -1,2 +1,2 @@
-from .message_bus import bus, MessageBus
+from .message_bus import MessageBus
 from .base_bot import BaseBot

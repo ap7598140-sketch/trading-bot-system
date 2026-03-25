@@ -11,7 +11,7 @@ import sys
 import os
 
 from config import RedisConfig, LOG_DIR
-from shared.message_bus import bus
+from shared.message_bus import MessageBus
 
 
 class BaseBot(ABC):
@@ -28,7 +28,7 @@ class BaseBot(ABC):
         self.name     = name
         self.model    = model
         self.running  = False
-        self.bus      = bus
+        self.bus      = MessageBus()   # each bot owns its own connection
 
         # Configure per-bot log file
         log_file = os.path.join(LOG_DIR, f"bot{bot_id:02d}_{name.lower().replace(' ', '_')}.log")
