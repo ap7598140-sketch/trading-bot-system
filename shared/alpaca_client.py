@@ -101,7 +101,8 @@ class AlpacaClient:
         )
         bars = self.data.get_stock_bars(req)
         result = {}
-        for sym, bar_list in bars.items():
+        bar_data = bars.data if hasattr(bars, "data") else bars
+        for sym, bar_list in bar_data.items():
             result[sym] = [
                 {
                     "timestamp": b.timestamp.isoformat(),
