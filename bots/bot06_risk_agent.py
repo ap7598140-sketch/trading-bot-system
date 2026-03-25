@@ -11,10 +11,11 @@ Role   : Portfolio risk gatekeeper.
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
 from typing import Optional
 
 import anthropic
+import pytz
 
 from config import Models, RedisConfig, RiskConfig, AnthropicConfig
 from shared.base_bot import BaseBot
@@ -22,6 +23,10 @@ from shared.alpaca_client import AlpacaClient
 
 
 POSITION_MONITOR_INTERVAL = 15   # seconds
+
+MARKET_TZ    = pytz.timezone("America/New_York")
+MARKET_OPEN  = dt_time(9, 30)
+MARKET_CLOSE = dt_time(16, 0)
 
 
 class RiskAgent(BaseBot):
@@ -64,6 +69,16 @@ class RiskAgent(BaseBot):
 
     async def cleanup(self):
         self.log("Risk Agent stopped")
+
+    # ── Market session ─────────────────────────────────────────────────────────
+
+    def _get_market_session(self) -> str:
+        now_et = datetime.now(MARKET_TZ).time()
+        if MARKET_OPEN <= now_et < MARKET_CLOSE:
+            return "open"
+        elif now_et < MARKET_OPEN:
+            return "pre_market"
+        return "closed"
 
     # ── Portfolio refresh ──────────────────────────────────────────────────────
 
@@ -218,6 +233,14 @@ class RiskAgent(BaseBot):
             return
 
         sym = setup.get("symbol", "?")
+
+        # Outside market hours: simulate validation only, never publish orders or rejections
+        if self._get_market_session() != "open":
+            hard_passed, hard_reasons = self._hard_checks(setup)
+            status = "PASS" if hard_passed else f"FAIL: {', '.join(hard_reasons[:2])}"
+            self.log(f"SIMULATED (pre-market) {sym}: {status}")
+            return
+
         await self._refresh_portfolio()
 
         # 1. Hard rules
@@ -316,8 +339,8 @@ class RiskAgent(BaseBot):
                 })
                 self.log(f"TAKE PROFIT: {sym} | pnl={pnl_pct*100:.2f}%")
 
-        # Daily loss circuit breaker
-        if self._daily_start_value > 0:
+        # Daily loss circuit breaker — only during market hours
+        if self._daily_start_value > 0 and self._get_market_session() == "open":
             daily_loss_pct = self._daily_pnl / self._daily_start_value
             if daily_loss_pct < -RiskConfig.MAX_DAILY_LOSS:
                 await self.publish(RedisConfig.CHANNEL_ORDERS, {

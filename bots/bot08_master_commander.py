@@ -75,6 +75,7 @@ class MasterCommander(BaseBot):
         self._portfolio_value   = 0.0
         self._session_start_val = 0.0
         self._total_commands    = 0
+        self._real_trades_today = 0       # submitted orders; halt requires >= 10
 
         # Aggregated signals
         self._risk_stats:      dict = {}
@@ -122,12 +123,25 @@ class MasterCommander(BaseBot):
     async def _on_alert(self, data: dict):
         alert_type = data.get("type", "")
 
-        # Critical alerts that may require immediate action — guard against repeat triggers
+        # Track real submitted orders so we know real trading is happening
+        if alert_type == "order_submitted":
+            self._real_trades_today += 1
+
+        # Critical alerts — only act during market_open with real trading activity
         if alert_type in ("daily_loss_halt", "execution_halted"):
-            if not self._system_halted:
+            if (not self._system_halted
+                    and self._market_session == "open"
+                    and self._real_trades_today >= 10):
                 self._system_halted = True
                 self.log(f"System halt triggered: {alert_type}", "critical")
                 await self._emergency_halt(data.get("reason", alert_type))
+            elif self._market_session != "open":
+                self.log(f"Ignoring {alert_type} outside market hours", "warning")
+            elif self._real_trades_today < 10:
+                self.log(
+                    f"Ignoring {alert_type} — only {self._real_trades_today} real trades "
+                    f"submitted (need 10 before halt activates)", "warning"
+                )
 
         elif alert_type == "stop_loss_triggered":
             sym = data.get("symbol")
@@ -280,11 +294,12 @@ class MasterCommander(BaseBot):
                     })
                     self.log("Auto-halt: market closed")
 
-            elif session == "open" and self._system_halted:
-                # Reset halt state so a new trading day can halt if needed
-                self._system_halted  = False
-                self._halt_published = False
-                self.log("Market opened – trading resumed")
+            elif session == "open":
+                if self._system_halted:
+                    self._system_halted  = False
+                    self._halt_published = False
+                    self.log("Market opened – trading resumed")
+                self._real_trades_today = 0   # reset daily counter each open
 
         # Bot health
         bot_health = self._check_bot_health()
