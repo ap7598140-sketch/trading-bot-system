@@ -49,6 +49,7 @@ class RiskAgent(BaseBot):
         self._daily_start_value: float  = 0.0
         self._rejected_today: int       = 0
         self._approved_today: int       = 0
+        self._pre_market_logged: set    = set()  # symbols already logged during pre-market
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -60,7 +61,14 @@ class RiskAgent(BaseBot):
         self.log(f"Risk Agent starting | portfolio=${self._portfolio_value:,.2f}")
 
     async def run(self):
+        _last_session = self._get_market_session()
         while self.running:
+            session = self._get_market_session()
+            # Reset pre-market dedup set when market opens
+            if session == "open" and _last_session != "open":
+                self._pre_market_logged.clear()
+                self.log("Market open — pre-market simulation log reset")
+            _last_session = session
             try:
                 await self._monitor_positions()
             except Exception as e:
@@ -236,9 +244,11 @@ class RiskAgent(BaseBot):
 
         # Outside market hours: simulate validation only, never publish orders or rejections
         if self._get_market_session() != "open":
-            hard_passed, hard_reasons = self._hard_checks(setup)
-            status = "PASS" if hard_passed else f"FAIL: {', '.join(hard_reasons[:2])}"
-            self.log(f"SIMULATED (pre-market) {sym}: {status}")
+            if sym not in self._pre_market_logged:
+                hard_passed, hard_reasons = self._hard_checks(setup)
+                status = "PASS" if hard_passed else f"FAIL: {', '.join(hard_reasons[:2])}"
+                self.log(f"SIMULATED (pre-market) {sym}: {status}")
+                self._pre_market_logged.add(sym)
             return
 
         await self._refresh_portfolio()

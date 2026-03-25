@@ -41,6 +41,7 @@ class StrategyAgent(BaseBot):
         self._momentum_signals: list[dict]   = []
         self._options_signals: list[dict]    = []
         self._last_decision: datetime | None = None  # debounce for event-driven cycles
+        self._portfolio_value: float         = 0.0   # synced from risk agent state
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -91,6 +92,29 @@ class StrategyAgent(BaseBot):
         self._options_signals.append(data)
         if len(self._options_signals) > 30:
             self._options_signals = self._options_signals[-30:]
+
+    # ── Position sizing ────────────────────────────────────────────────────────
+
+    def _safe_position_size(self, entry: float, stop_loss: float) -> float:
+        """
+        Calculate position size so that risk never exceeds MAX_PORTFOLIO_RISK.
+        Formula:
+          max_risk_dollars = portfolio_value * MAX_PORTFOLIO_RISK
+          risk_per_share   = abs(entry - stop_loss)
+          shares           = floor(max_risk_dollars / risk_per_share)
+          position_usd     = shares * entry
+        Also caps at MAX_POSITION_SIZE.
+        """
+        pv = self._portfolio_value or 1000.0  # safe fallback
+        max_risk = pv * RiskConfig.MAX_PORTFOLIO_RISK          # e.g. $20 for $1000 portfolio
+        if entry <= 0 or stop_loss <= 0:
+            return min(max_risk, RiskConfig.MAX_POSITION_SIZE)
+        risk_per_share = abs(entry - stop_loss)
+        if risk_per_share <= 0:
+            return min(max_risk, RiskConfig.MAX_POSITION_SIZE)
+        shares   = max_risk / risk_per_share
+        pos_usd  = shares * entry
+        return min(round(pos_usd, 2), RiskConfig.MAX_POSITION_SIZE)
 
     # ── Signal aggregation ─────────────────────────────────────────────────────
 
@@ -156,19 +180,32 @@ class StrategyAgent(BaseBot):
     async def _generate_trade_setups(self, signals: dict) -> list[dict]:
         """Use Sonnet to synthesise signals into actionable trade setups."""
 
+        # Refresh portfolio value from risk agent state
+        try:
+            risk_stats = await self.bus.get_state("bot6:stats") or {}
+            pv = risk_stats.get("portfolio_value", 0)
+            if pv:
+                self._portfolio_value = pv
+        except Exception:
+            pass
+        pv = self._portfolio_value or 1000.0
+        max_risk_dollars = round(pv * RiskConfig.MAX_PORTFOLIO_RISK, 2)
+
         prompt = (
             "You are an expert stock trader synthesising real-time signals into trade setups.\n\n"
             "RISK RULES (hard constraints):\n"
-            f"  • Max position size: ${RiskConfig.MAX_POSITION_SIZE:,.0f}\n"
-            f"  • Max risk per trade: {RiskConfig.MAX_PORTFOLIO_RISK*100:.1f}% of portfolio\n"
-            f"  • Stop loss: {RiskConfig.STOP_LOSS_PCT*100:.1f}%\n"
-            f"  • Take profit: {RiskConfig.TAKE_PROFIT_PCT*100:.1f}%\n"
+            f"  • Portfolio value: ${pv:,.2f}\n"
+            f"  • Max risk per trade: {RiskConfig.MAX_PORTFOLIO_RISK*100:.1f}% = ${max_risk_dollars:.2f}\n"
+            f"  • position_size_usd = (max_risk_dollars / risk_per_share) * entry_price\n"
+            f"    Example: risk=$20, entry=$100, stop=$98 → shares=10, size=$1000\n"
+            f"  • Stop loss: {RiskConfig.STOP_LOSS_PCT*100:.1f}% from entry\n"
+            f"  • Take profit: {RiskConfig.TAKE_PROFIT_PCT*100:.1f}% from entry\n"
             f"  • Max open positions: {RiskConfig.MAX_OPEN_POSITIONS}\n\n"
             "SIGNALS:\n"
             f"{json.dumps(signals, indent=2)}\n\n"
             "Generate up to 3 high-conviction trade setups. Each setup must include:\n"
             "  - symbol, direction (long/short), entry_price, stop_loss, take_profit\n"
-            "  - position_size_usd (respect the max)\n"
+            "  - position_size_usd (calculated from the risk formula above — keep it SMALL)\n"
             "  - confidence (0-1), timeframe (scalp/intraday/swing)\n"
             "  - thesis (2-3 sentences explaining the confluence of signals)\n"
             "  - required_confirmations (list of conditions that must be met before entry)\n"
@@ -177,7 +214,7 @@ class StrategyAgent(BaseBot):
             "Respond ONLY with JSON:\n"
             "{\"setups\": [{\"symbol\": \"AAPL\", \"direction\": \"long\", "
             "\"entry_price\": 195.50, \"stop_loss\": 191.59, \"take_profit\": 203.32, "
-            "\"position_size_usd\": 5000, \"confidence\": 0.78, "
+            "\"position_size_usd\": 980, \"confidence\": 0.78, "
             "\"timeframe\": \"intraday\", \"thesis\": \"...\", "
             "\"required_confirmations\": [\"price above VWAP\", \"RSI > 55\"], "
             "\"risk_reward_ratio\": 2.0}], "
@@ -198,7 +235,16 @@ class StrategyAgent(BaseBot):
             if "```" in raw:
                 raw = raw.split("```")[1].lstrip("json").strip()
             parsed = json.loads(raw)
-            return parsed.get("setups", []), parsed.get("market_bias", "neutral"), parsed.get("notes", "")
+            setups = parsed.get("setups", [])
+
+            # Enforce correct position sizing regardless of what AI returned
+            for s in setups:
+                entry = s.get("entry_price", 0)
+                sl    = s.get("stop_loss", 0)
+                if entry and sl:
+                    s["position_size_usd"] = self._safe_position_size(entry, sl)
+
+            return setups, parsed.get("market_bias", "neutral"), parsed.get("notes", "")
         except Exception as e:
             self.log(f"Strategy generation error: {e}", "error")
             return [], "neutral", ""
