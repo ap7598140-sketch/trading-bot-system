@@ -26,6 +26,63 @@ from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 
 
+# ── JSON cleaning helper ───────────────────────────────────────────────────────
+
+def _extract_json_object(text: str) -> str:
+    """
+    Walk the string character-by-character to extract the outermost {...} block,
+    correctly handling nested braces and quoted strings.
+    Falls back to the original text if no object is found.
+    """
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    in_string = False
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and in_string:
+            i += 2          # skip escaped character
+            continue
+        if ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        i += 1
+    return text[start:]     # unterminated — return what we have
+
+
+def _clean_llm_json(raw: str) -> str:
+    """
+    Progressively clean common LLM JSON malformations so json.loads can parse.
+    Order matters: strip fences → extract object → remove comments →
+    fix Python literals → fix trailing commas.
+    """
+    # 1. Strip markdown code fences
+    raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"\n?```$", "", raw, flags=re.MULTILINE).strip()
+    # 2. Extract the outermost {...} using bracket-tracking
+    raw = _extract_json_object(raw)
+    # 3. Remove // single-line comments
+    raw = re.sub(r"//[^\n\"]*(?=\"|\n|$)", "", raw)
+    # 4. Remove /* block comments */
+    raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
+    # 5. Replace Python/JS literals
+    raw = re.sub(r"\bNone\b",  "null",  raw)
+    raw = re.sub(r"\bTrue\b",  "true",  raw)
+    raw = re.sub(r"\bFalse\b", "false", raw)
+    # 6. Remove trailing commas before ] or } (run twice for nested cases)
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
+    return raw.strip()
+
+
 # ── Technical indicator helpers ────────────────────────────────────────────────
 
 def calc_rsi(closes: list[float], period: int = 14) -> Optional[float]:
@@ -309,18 +366,10 @@ class DataAgent(BaseBot):
                 ),
             )
             raw = response.content[0].text.strip()
-            # Strip markdown code fences
-            raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
-            raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
-            # Extract first {...} block in case of extra prose
-            m = re.search(r"\{.*\}", raw, re.DOTALL)
-            raw = m.group(0) if m else raw
-            # Remove trailing commas before ] or }
-            raw = re.sub(r",\s*([}\]])", r"\1", raw)
             try:
-                parsed = json.loads(raw)
+                parsed = json.loads(_clean_llm_json(raw))
             except json.JSONDecodeError as e:
-                self.log(f"AI anomaly scan JSON parse failed: {e}", "warning")
+                self.log(f"AI anomaly scan JSON parse failed: {e} | snippet={raw[:120]!r}", "warning")
                 return {}
             flagged = parsed.get("flagged", [])
             return {item["symbol"]: item for item in flagged if "symbol" in item}
