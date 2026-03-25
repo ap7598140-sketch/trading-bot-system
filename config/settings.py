@@ -86,6 +86,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 # ── Alerts ─────────────────────────────────────────────────────────────────────
 class AlertConfig:
-    EMAIL           = os.getenv("ALERT_EMAIL", "")
-    SLACK_WEBHOOK   = os.getenv("SLACK_WEBHOOK_URL", "")
-    NEWS_API_KEY    = os.getenv("NEWS_API_KEY", "")
+    EMAIL              = os.getenv("ALERT_EMAIL", "")
+    SLACK_WEBHOOK      = os.getenv("SLACK_WEBHOOK_URL", "")
+    NEWS_API_KEY       = os.getenv("NEWS_API_KEY", "")
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
