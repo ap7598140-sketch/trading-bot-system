@@ -62,6 +62,8 @@ class ExecutionAgent(BaseBot):
         event_type = event.get("type")
 
         if event_type == "halt_trading":
+            if self._trading_halted:
+                return   # already halted — ignore duplicates
             self._trading_halted = True
             self.log(f"TRADING HALTED: {event.get('reason')}", "critical")
             await self._cancel_all_pending()

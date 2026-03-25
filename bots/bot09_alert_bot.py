@@ -66,7 +66,9 @@ class AlertBot(BaseBot):
 
         self._alert_history: list[dict]       = []
         self._last_sent: dict[str, datetime]  = {}   # alert_type → last_sent time
+        self._last_seen: dict[str, datetime]  = {}   # alert_type → last received time (dedup)
         self._counts: dict[str, int]          = defaultdict(int)
+        self._DEDUP_SECONDS                   = 60   # ignore same alert type within this window
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -88,6 +90,14 @@ class AlertBot(BaseBot):
 
     async def _on_alert(self, data: dict):
         alert_type = data.get("type", "unknown")
+
+        # Deduplicate: drop the same alert type if seen within the last 60 seconds
+        now = datetime.utcnow()
+        last = self._last_seen.get(alert_type)
+        if last and (now - last).total_seconds() < self._DEDUP_SECONDS:
+            return
+        self._last_seen[alert_type] = now
+
         severity   = SEVERITY.get(alert_type, "info")
 
         # Log always

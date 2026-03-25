@@ -69,6 +69,7 @@ class MasterCommander(BaseBot):
 
         # System state
         self._system_halted     = False
+        self._halt_published    = False   # prevents publishing halt signal more than once
         self._market_session    = "unknown"
         self._daily_pnl         = 0.0
         self._portfolio_value   = 0.0
@@ -231,10 +232,13 @@ class MasterCommander(BaseBot):
     # ── Emergency halt ─────────────────────────────────────────────────────────
 
     async def _emergency_halt(self, reason: str):
-        self._system_halted = True
+        # Never publish the halt signal more than once per session
+        if self._halt_published:
+            return
+        self._halt_published = True
+        self._system_halted  = True
         self.log(f"EMERGENCY HALT: {reason}", "critical")
 
-        # Broadcast halt to all bots
         await self.publish(RedisConfig.CHANNEL_ORDERS, {
             "type":     "halt_trading",
             "reason":   reason,
@@ -277,8 +281,9 @@ class MasterCommander(BaseBot):
                     self.log("Auto-halt: market closed")
 
             elif session == "open" and self._system_halted:
-                # Check if halt was due to market close (resume on open)
-                self._system_halted = False
+                # Reset halt state so a new trading day can halt if needed
+                self._system_halted  = False
+                self._halt_published = False
                 self.log("Market opened – trading resumed")
 
         # Bot health
@@ -329,11 +334,8 @@ class MasterCommander(BaseBot):
                     await loop.run_in_executor(None, self.alpaca.close_all_positions)
                 except Exception as e:
                     self.log(f"Close all failed: {e}", "error")
-            elif session_action == "pause":
-                await self.publish(RedisConfig.CHANNEL_ORDERS, {
-                    "type":   "halt_trading",
-                    "reason": "Commander paused trading",
-                })
+            elif session_action == "pause" and not self._system_halted:
+                await self._emergency_halt("Commander paused trading")
 
             if decision.get("alert_operator") and decision.get("operator_message"):
                 await self.publish(RedisConfig.CHANNEL_ALERTS, {
