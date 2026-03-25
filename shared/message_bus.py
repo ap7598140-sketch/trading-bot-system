@@ -2,9 +2,14 @@
 Redis-based message bus for inter-bot communication.
 All bots publish/subscribe through this module.
 
-Each bot gets its own MessageBus instance (created in BaseBot.__init__).
-publish/state ops use self._redis; listen() creates its own dedicated
-pubsub connection so concurrent subscribers never share a socket.
+Design: each bot owns one MessageBus instance (created in BaseBot.__init__).
+Two completely separate Redis connections are created in connect():
+  - self._redis       : connection pool for publish / get_state / set_state
+  - self._pubsub_conn : single dedicated client for pubsub only
+                        (health_check_interval=0 prevents background reads
+                         from racing with the blocking pubsub.listen() loop)
+listen() uses self._pubsub which was set up in connect() — it never creates
+connections lazily, so there is no race between task start and socket setup.
 """
 
 import json
@@ -20,21 +25,52 @@ def _redis_url() -> str:
 
 
 class MessageBus:
-    """Async Redis pub/sub message bus. One instance per bot."""
+    """Async Redis pub/sub message bus.  One instance per bot."""
 
     def __init__(self):
-        self._redis: aioredis.Redis | None = None          # publish + state ops
+        self._redis: aioredis.Redis | None = None          # publish + state
+        self._pubsub_conn: aioredis.Redis | None = None    # dedicated pubsub
+        self._pubsub = None
         self._subscriptions: dict[str, list[Callable]] = {}
 
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+
     async def connect(self):
+        # Pool for publish / get / set  (concurrent-safe, pooled)
         self._redis = await aioredis.from_url(
-            _redis_url(), decode_responses=True,
+            _redis_url(),
+            decode_responses=True,
         )
+        # Dedicated single client for pubsub reads only.
+        # health_check_interval=0 disables background pings that would race
+        # with the blocking pubsub.listen() async generator.
+        self._pubsub_conn = await aioredis.from_url(
+            _redis_url(),
+            decode_responses=True,
+            health_check_interval=0,
+        )
+        self._pubsub = self._pubsub_conn.pubsub(ignore_subscribe_messages=True)
         logger.info("MessageBus connected to Redis")
 
     async def disconnect(self):
+        if self._pubsub:
+            try:
+                await self._pubsub.unsubscribe()
+                await self._pubsub.aclose()
+            except Exception:
+                pass
+            self._pubsub = None
+        if self._pubsub_conn:
+            try:
+                await self._pubsub_conn.aclose()
+            except Exception:
+                pass
+            self._pubsub_conn = None
         if self._redis:
-            await self._redis.aclose()
+            try:
+                await self._redis.aclose()
+            except Exception:
+                pass
             self._redis = None
 
     # ── Publish ────────────────────────────────────────────────────────────────
@@ -47,29 +83,23 @@ class MessageBus:
     # ── Subscribe / listen ────────────────────────────────────────────────────
 
     async def subscribe(self, channel: str, handler: Callable):
-        """Register a handler for a channel (call before listen())."""
+        """Register a handler for a channel.  Call before listen()."""
         self._subscriptions.setdefault(channel, []).append(handler)
 
     async def listen(self):
         """
-        Start listening on all subscribed channels.
-        Creates a *dedicated* Redis connection + pubsub so this bot's
-        socket is never shared with another coroutine.
+        Listen on all subscribed channels using the dedicated pubsub connection
+        created in connect().  Only one coroutine ever reads from this socket.
         """
-        if not self._subscriptions:
+        if not self._pubsub or not self._subscriptions:
             return
 
-        # Dedicated connection for blocking pubsub reads
-        pubsub_conn = await aioredis.from_url(
-            _redis_url(), decode_responses=True,
-        )
-        pubsub = pubsub_conn.pubsub()
         channels = list(self._subscriptions.keys())
-        await pubsub.subscribe(*channels)
+        await self._pubsub.subscribe(*channels)
         logger.info(f"MessageBus listening on: {channels}")
 
         try:
-            async for message in pubsub.listen():
+            async for message in self._pubsub.listen():
                 if message["type"] != "message":
                     continue
                 channel = message["channel"]
@@ -82,9 +112,8 @@ class MessageBus:
                         await handler(data)
                     except Exception as e:
                         logger.error(f"Handler error on {channel}: {e}")
-        finally:
-            await pubsub.aclose()
-            await pubsub_conn.aclose()
+        except asyncio.CancelledError:
+            pass
 
     # ── State ──────────────────────────────────────────────────────────────────
 
