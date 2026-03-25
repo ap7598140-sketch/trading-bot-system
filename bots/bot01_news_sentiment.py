@@ -8,6 +8,7 @@ Role   : Continuously fetches financial news headlines for watchlist symbols,
 
 import asyncio
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 import aiohttp
@@ -144,10 +145,20 @@ class NewsSentimentBot(BaseBot):
                 ),
             )
             raw = response.content[0].text.strip()
-            if "```" in raw:
-                raw = raw.split("```")[1].lstrip("json").strip()
-            parsed  = json.loads(raw)
-            results = {r["id"]: r for r in parsed.get("results", [])}
+            # Strip markdown code fences
+            raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
+            raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
+            # Extract first {...} block in case of extra prose
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            raw = m.group(0) if m else raw
+            # Remove trailing commas before ] or }
+            raw = re.sub(r",\s*([}\]])", r"\1", raw)
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as e:
+                self.log(f"Sentiment scoring JSON parse failed: {e}", "warning")
+                return []
+            results = {r["id"]: r for r in parsed.get("results", []) if "id" in r}
 
             scored = []
             for i, article in enumerate(articles):
