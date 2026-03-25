@@ -76,6 +76,7 @@ class MasterCommander(BaseBot):
         self._session_start_val = 0.0
         self._total_commands    = 0
         self._real_trades_today = 0       # submitted orders; halt requires >= 10
+        self._halt_ignored_logged = False # log "ignoring halt" warning only once
 
         # Aggregated signals
         self._risk_stats:      dict = {}
@@ -136,7 +137,9 @@ class MasterCommander(BaseBot):
                 self.log(f"System halt triggered: {alert_type}", "critical")
                 await self._emergency_halt(data.get("reason", alert_type))
             elif self._market_session != "open":
-                self.log(f"Ignoring {alert_type} outside market hours", "warning")
+                if not self._halt_ignored_logged:
+                    self._halt_ignored_logged = True
+                    self.log(f"Ignoring {alert_type} outside market hours (further duplicates suppressed)", "warning")
             elif self._real_trades_today < 10:
                 self.log(
                     f"Ignoring {alert_type} — only {self._real_trades_today} real trades "
@@ -299,7 +302,8 @@ class MasterCommander(BaseBot):
                     self._system_halted  = False
                     self._halt_published = False
                     self.log("Market opened – trading resumed")
-                self._real_trades_today = 0   # reset daily counter each open
+                self._real_trades_today    = 0     # reset daily counter each open
+                self._halt_ignored_logged  = False # allow one warning next pre-market
 
         # Bot health
         bot_health = self._check_bot_health()

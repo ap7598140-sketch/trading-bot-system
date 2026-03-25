@@ -47,7 +47,7 @@ async def main():
     logger.add(sys.stdout, level="INFO",
                format="<green>{time:HH:mm:ss}</green> | <level>{level:7}</level> | "
                       "<cyan>{extra[bot]}</cyan> | {message}",
-               filter=lambda r: True)
+               filter=lambda r: "bot" in r["extra"])
     logger.add("logs/system.log", rotation="100 MB", retention="7 days")
 
     logger.info("=" * 60)
