@@ -361,15 +361,14 @@ class DataAgent(BaseBot):
                 None,
                 lambda: self.client.messages.create(
                     model=self.model,
-                    max_tokens=512,
+                    max_tokens=2000,
                     messages=[{"role": "user", "content": prompt}],
                 ),
             )
             raw = response.content[0].text.strip()
             try:
                 parsed = json.loads(_clean_llm_json(raw))
-            except json.JSONDecodeError as e:
-                self.log(f"AI anomaly scan JSON parse failed: {e} | snippet={raw[:120]!r}", "warning")
+            except json.JSONDecodeError:
                 return {}
             flagged = parsed.get("flagged", [])
             return {item["symbol"]: item for item in flagged if "symbol" in item}
