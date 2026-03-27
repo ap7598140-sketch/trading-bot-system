@@ -158,6 +158,8 @@ class NewsSentimentBot(BaseBot):
             except json.JSONDecodeError as e:
                 self.log(f"Sentiment scoring JSON parse failed: {e}", "warning")
                 return []
+            if isinstance(parsed, list):
+                parsed = {"results": parsed}
             results = {r["id"]: r for r in parsed.get("results", []) if "id" in r}
 
             scored = []
