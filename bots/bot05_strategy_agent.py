@@ -19,7 +19,7 @@ from config import Models, RedisConfig, RiskConfig, AnthropicConfig
 from shared.base_bot import BaseBot
 
 
-DECISION_DEBOUNCE = 120  # min seconds between decision cycles (2 min)
+DECISION_DEBOUNCE = 600  # min seconds between decision cycles (10 min)
 
 
 class StrategyAgent(BaseBot):
