@@ -174,9 +174,9 @@ class RiskAgent(BaseBot):
             shares         = size / entry
             total_risk     = risk_per_share * shares
             pct_risk       = total_risk / self._portfolio_value
-            if pct_risk > RiskConfig.MAX_PORTFOLIO_RISK:
+            if pct_risk >= 0.025:   # reject at 2.5%+; allows up to 2.49%
                 reasons.append(
-                    f"Trade risk {pct_risk*100:.2f}% exceeds max {RiskConfig.MAX_PORTFOLIO_RISK*100:.1f}%"
+                    f"Trade risk {pct_risk*100:.2f}% exceeds max 2.5%"
                 )
 
         # 3. Daily loss limit

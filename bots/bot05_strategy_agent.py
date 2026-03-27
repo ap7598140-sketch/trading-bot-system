@@ -97,34 +97,27 @@ class StrategyAgent(BaseBot):
 
     def _safe_position_size(self, entry: float, stop_loss: float) -> float:
         """
-        Calculate position size with two hard caps:
-          1. Risk cap:     shares = max_risk_dollars / risk_per_share
-                           max_risk_dollars = portfolio * MAX_PORTFOLIO_RISK (e.g. $20)
-          2. Notional cap: never more than 20% of portfolio (e.g. $200 on $1,000)
-
-        Example for $1,000 portfolio, NVDA $900, stop $891 ($9 stop distance):
-          max_risk   = $20
-          shares     = $20 / $9 = 2.22  →  rounded down to 2
-          notional   = 2 * $900 = $1,800  →  capped at $200
-          final size = $200
+        Exact sizing formula for a small account:
+          portfolio      = actual value or $1,000 fallback
+          max_position   = portfolio * 20%   (e.g. $200)
+          max_risk       = portfolio * 1.9%  (e.g. $19 — stays under the 2% hard limit)
+          shares         = int(max_risk / stop_distance)  ← whole shares only
+          position_usd   = min(shares * entry, max_position)
         """
-        pv            = self._portfolio_value or 1000.0
-        max_risk      = pv * RiskConfig.MAX_PORTFOLIO_RISK   # e.g. $20
-        max_notional  = pv * 0.20                            # e.g. $200 (20% of portfolio)
+        pv             = self._portfolio_value or 1000.0
+        max_position_usd = pv * 0.20          # $200 on $1,000
+        max_risk_usd     = pv * 0.019         # $19 on $1,000  (safely under 2%)
 
         if entry <= 0 or stop_loss <= 0:
-            return round(min(max_risk, max_notional), 2)
+            return round(min(max_risk_usd, max_position_usd), 2)
 
-        risk_per_share = abs(entry - stop_loss)
-        if risk_per_share <= 0:
-            return round(min(max_risk, max_notional), 2)
+        stop_distance = abs(entry - stop_loss)
+        if stop_distance <= 0:
+            return round(min(max_risk_usd, max_position_usd), 2)
 
-        shares  = max_risk / risk_per_share          # risk-based share count
-        pos_usd = shares * entry                     # notional value
-
-        # Apply both caps: portfolio-relative notional cap and absolute config cap
-        pos_usd = min(pos_usd, max_notional, RiskConfig.MAX_POSITION_SIZE)
-        return round(pos_usd, 2)
+        shares       = int(max_risk_usd / stop_distance)   # whole shares only
+        position_usd = min(shares * entry, max_position_usd)
+        return round(position_usd, 2)
 
     # ── Signal aggregation ─────────────────────────────────────────────────────
 
