@@ -97,24 +97,34 @@ class StrategyAgent(BaseBot):
 
     def _safe_position_size(self, entry: float, stop_loss: float) -> float:
         """
-        Calculate position size so that risk never exceeds MAX_PORTFOLIO_RISK.
-        Formula:
-          max_risk_dollars = portfolio_value * MAX_PORTFOLIO_RISK
-          risk_per_share   = abs(entry - stop_loss)
-          shares           = floor(max_risk_dollars / risk_per_share)
-          position_usd     = shares * entry
-        Also caps at MAX_POSITION_SIZE.
+        Calculate position size with two hard caps:
+          1. Risk cap:     shares = max_risk_dollars / risk_per_share
+                           max_risk_dollars = portfolio * MAX_PORTFOLIO_RISK (e.g. $20)
+          2. Notional cap: never more than 20% of portfolio (e.g. $200 on $1,000)
+
+        Example for $1,000 portfolio, NVDA $900, stop $891 ($9 stop distance):
+          max_risk   = $20
+          shares     = $20 / $9 = 2.22  →  rounded down to 2
+          notional   = 2 * $900 = $1,800  →  capped at $200
+          final size = $200
         """
-        pv = self._portfolio_value or 1000.0  # safe fallback
-        max_risk = pv * RiskConfig.MAX_PORTFOLIO_RISK          # e.g. $20 for $1000 portfolio
+        pv            = self._portfolio_value or 1000.0
+        max_risk      = pv * RiskConfig.MAX_PORTFOLIO_RISK   # e.g. $20
+        max_notional  = pv * 0.20                            # e.g. $200 (20% of portfolio)
+
         if entry <= 0 or stop_loss <= 0:
-            return min(max_risk, RiskConfig.MAX_POSITION_SIZE)
+            return round(min(max_risk, max_notional), 2)
+
         risk_per_share = abs(entry - stop_loss)
         if risk_per_share <= 0:
-            return min(max_risk, RiskConfig.MAX_POSITION_SIZE)
-        shares   = max_risk / risk_per_share
-        pos_usd  = shares * entry
-        return min(round(pos_usd, 2), RiskConfig.MAX_POSITION_SIZE)
+            return round(min(max_risk, max_notional), 2)
+
+        shares  = max_risk / risk_per_share          # risk-based share count
+        pos_usd = shares * entry                     # notional value
+
+        # Apply both caps: portfolio-relative notional cap and absolute config cap
+        pos_usd = min(pos_usd, max_notional, RiskConfig.MAX_POSITION_SIZE)
+        return round(pos_usd, 2)
 
     # ── Signal aggregation ─────────────────────────────────────────────────────
 
@@ -188,16 +198,19 @@ class StrategyAgent(BaseBot):
                 self._portfolio_value = pv
         except Exception:
             pass
-        pv = self._portfolio_value or 1000.0
-        max_risk_dollars = round(pv * RiskConfig.MAX_PORTFOLIO_RISK, 2)
+        pv              = self._portfolio_value or 1000.0
+        max_risk_dollars = round(pv * RiskConfig.MAX_PORTFOLIO_RISK, 2)  # e.g. $20
+        max_notional     = round(pv * 0.20, 2)                           # e.g. $200
 
         prompt = (
             "You are an expert stock trader synthesising real-time signals into trade setups.\n\n"
-            "RISK RULES (hard constraints):\n"
-            f"  • Portfolio value: ${pv:,.2f}\n"
-            f"  • Max risk per trade: {RiskConfig.MAX_PORTFOLIO_RISK*100:.1f}% = ${max_risk_dollars:.2f}\n"
-            f"  • position_size_usd = (max_risk_dollars / risk_per_share) * entry_price\n"
-            f"    Example: risk=$20, entry=$100, stop=$98 → shares=10, size=$1000\n"
+            "POSITION SIZING RULES (hard constraints — this is a SMALL account):\n"
+            f"  • Portfolio value:        ${pv:,.2f}\n"
+            f"  • Max risk per trade:     {RiskConfig.MAX_PORTFOLIO_RISK*100:.1f}% = ${max_risk_dollars:.2f}\n"
+            f"  • Max position notional:  20% of portfolio = ${max_notional:.2f}  ← HARD CAP\n"
+            f"  • Sizing formula: shares = max_risk / stop_distance\n"
+            f"    Then cap: position_size_usd = min(shares * entry, ${max_notional:.2f})\n"
+            f"  • Example: entry=$200, stop=$196 ($4 stop) → shares=$20/$4=5 → size=$1,000 → capped at ${max_notional:.2f}\n"
             f"  • Stop loss: {RiskConfig.STOP_LOSS_PCT*100:.1f}% from entry\n"
             f"  • Take profit: {RiskConfig.TAKE_PROFIT_PCT*100:.1f}% from entry\n"
             f"  • Max open positions: {RiskConfig.MAX_OPEN_POSITIONS}\n\n"
@@ -205,7 +218,7 @@ class StrategyAgent(BaseBot):
             f"{json.dumps(signals, indent=2)}\n\n"
             "Generate up to 3 high-conviction trade setups. Each setup must include:\n"
             "  - symbol, direction (long/short), entry_price, stop_loss, take_profit\n"
-            "  - position_size_usd (calculated from the risk formula above — keep it SMALL)\n"
+            f"  - position_size_usd (MUST be <= ${max_notional:.2f} — enforce the cap)\n"
             "  - confidence (0-1), timeframe (scalp/intraday/swing)\n"
             "  - thesis (2-3 sentences explaining the confluence of signals)\n"
             "  - required_confirmations (list of conditions that must be met before entry)\n"
@@ -214,7 +227,7 @@ class StrategyAgent(BaseBot):
             "Respond ONLY with JSON:\n"
             "{\"setups\": [{\"symbol\": \"AAPL\", \"direction\": \"long\", "
             "\"entry_price\": 195.50, \"stop_loss\": 191.59, \"take_profit\": 203.32, "
-            "\"position_size_usd\": 980, \"confidence\": 0.78, "
+            "\"position_size_usd\": 200, \"confidence\": 0.78, "
             "\"timeframe\": \"intraday\", \"thesis\": \"...\", "
             "\"required_confirmations\": [\"price above VWAP\", \"RSI > 55\"], "
             "\"risk_reward_ratio\": 2.0}], "
