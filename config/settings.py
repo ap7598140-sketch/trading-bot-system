@@ -56,7 +56,7 @@ class RedisConfig:
 # ── Risk limits ────────────────────────────────────────────────────────────────
 class RiskConfig:
     MAX_POSITION_SIZE   = float(os.getenv("MAX_POSITION_SIZE", "10000"))
-    MAX_PORTFOLIO_RISK  = float(os.getenv("MAX_PORTFOLIO_RISK", "0.02"))  # 2% per trade
+    MAX_PORTFOLIO_RISK  = float(os.getenv("MAX_PORTFOLIO_RISK", "0.025"))  # 2.5% per trade
     MAX_DAILY_LOSS      = 0.05    # 5% daily loss limit
     MAX_OPEN_POSITIONS  = 10
     STOP_LOSS_PCT       = 0.02    # 2% stop loss

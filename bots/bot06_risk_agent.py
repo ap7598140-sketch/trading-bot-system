@@ -11,6 +11,7 @@ Role   : Portfolio risk gatekeeper.
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone, time as dt_time
 from typing import Optional
 
@@ -101,6 +102,51 @@ class RiskAgent(BaseBot):
         except Exception as e:
             self.log(f"Portfolio refresh error: {e}", "warning")
 
+    # ── JSON cleaning ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _clean_llm_json(raw: str) -> str:
+        """Strip markdown fences, comments, and trailing commas from LLM JSON."""
+        # Remove markdown code fences
+        raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
+        # Remove // line comments
+        raw = re.sub(r"//[^\n]*", "", raw)
+        # Remove /* block comments */
+        raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
+        # Replace Python/JS literals
+        raw = raw.replace("None", "null").replace("True", "true").replace("False", "false")
+        # Remove trailing commas before } or ]
+        raw = re.sub(r",\s*([}\]])", r"\1", raw)
+        raw = re.sub(r",\s*([}\]])", r"\1", raw)  # second pass for nested cases
+        return raw.strip()
+
+    @staticmethod
+    def _extract_json_object(text: str) -> str:
+        """Extract the first complete {...} block using bracket tracking."""
+        start = text.find("{")
+        if start == -1:
+            return text
+        depth = 0
+        in_str = False
+        escape = False
+        for i, ch in enumerate(text[start:], start):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_str:
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+            elif not in_str:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i + 1]
+        return text[start:]
+
     # ── Hard risk checks ───────────────────────────────────────────────────────
 
     def _hard_checks(self, setup: dict) -> tuple[bool, list[str]]:
@@ -171,8 +217,8 @@ class RiskAgent(BaseBot):
                 reasons.append(f"Risk/reward {rr:.2f} below minimum 1.5")
 
         # 8. Confidence threshold
-        if setup.get("confidence", 0) < 0.65:
-            reasons.append(f"Confidence {setup.get('confidence'):.2f} below threshold 0.65")
+        if setup.get("confidence", 0) < 0.55:
+            reasons.append(f"Confidence {setup.get('confidence'):.2f} below threshold 0.55")
 
         return len(reasons) == 0, reasons
 
@@ -218,18 +264,19 @@ class RiskAgent(BaseBot):
                 None,
                 lambda: self.client.messages.create(
                     model=self.model,
-                    max_tokens=512,
+                    max_tokens=1024,
                     messages=[{"role": "user", "content": prompt}],
                 ),
             )
-            raw = response.content[0].text.strip()
-            if "```" in raw:
-                raw = raw.split("```")[1].lstrip("json").strip()
+            raw = self._clean_llm_json(response.content[0].text)
+            raw = self._extract_json_object(raw)
             result = json.loads(raw)
             # Hard rules cannot be overridden
             if not hard_passed:
                 result["approve"] = False
             return result
+        except json.JSONDecodeError:
+            return {"approve": hard_passed, "notes": "AI review parse failed, using hard rules only"}
         except Exception as e:
             self.log(f"AI risk review error: {e}", "warning")
             return {"approve": hard_passed, "notes": "AI review failed, using hard rules only"}
