@@ -97,25 +97,23 @@ class StrategyAgent(BaseBot):
 
     def _safe_position_size(self, entry: float, stop_loss: float) -> float:
         """
-        Exact sizing formula for a small account:
-          portfolio      = actual value or $1,000 fallback
-          max_position   = portfolio * 20%   (e.g. $200)
-          max_risk       = portfolio * 1.9%  (e.g. $19 — stays under the 2% hard limit)
-          shares         = int(max_risk / stop_distance)  ← whole shares only
-          position_usd   = min(shares * entry, max_position)
+        Hardcoded for a $1,000 account:
+          max_position = $200  (20% of $1,000)
+          max_risk     = $19   (1.9% of $1,000 — safely under the 2% gate)
+          shares       = int($19 / stop_distance)   ← whole shares only
+          position_usd = min(shares * entry, $200)  ← hard $200 cap
         """
-        pv             = self._portfolio_value or 1000.0
-        max_position_usd = pv * 0.20          # $200 on $1,000
-        max_risk_usd     = pv * 0.019         # $19 on $1,000  (safely under 2%)
+        max_position_usd = 200.0   # hard cap: 20% of $1,000
+        max_risk_usd     = 19.0    # hard cap: 1.9% of $1,000
 
         if entry <= 0 or stop_loss <= 0:
-            return round(min(max_risk_usd, max_position_usd), 2)
+            return max_risk_usd    # fallback: $19
 
         stop_distance = abs(entry - stop_loss)
         if stop_distance <= 0:
-            return round(min(max_risk_usd, max_position_usd), 2)
+            return max_risk_usd
 
-        shares       = int(max_risk_usd / stop_distance)   # whole shares only
+        shares       = int(max_risk_usd / stop_distance)   # whole shares, truncated
         position_usd = min(shares * entry, max_position_usd)
         return round(position_usd, 2)
 
@@ -243,12 +241,12 @@ class StrategyAgent(BaseBot):
             parsed = json.loads(raw)
             setups = parsed.get("setups", [])
 
-            # Enforce correct position sizing regardless of what AI returned
+            # Always enforce position sizing — never trust AI-generated values
             for s in setups:
-                entry = s.get("entry_price", 0)
-                sl    = s.get("stop_loss", 0)
-                if entry and sl:
-                    s["position_size_usd"] = self._safe_position_size(entry, sl)
+                s["position_size_usd"] = self._safe_position_size(
+                    s.get("entry_price", 0),
+                    s.get("stop_loss", 0),
+                )
 
             return setups, parsed.get("market_bias", "neutral"), parsed.get("notes", "")
         except Exception as e:
