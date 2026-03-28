@@ -140,7 +140,7 @@ class NewsSentimentBot(BaseBot):
                 None,
                 lambda: self.client.messages.create(
                     model=self.model,
-                    max_tokens=2000,
+                    max_tokens=3000,
                     messages=[{"role": "user", "content": prompt}],
                 ),
             )
@@ -162,9 +162,8 @@ class NewsSentimentBot(BaseBot):
 
             try:
                 parsed = json.loads(raw)
-            except json.JSONDecodeError as e:
-                self.log(f"Sentiment JSON parse failed: {e}", "warning")
-                return []
+            except json.JSONDecodeError:
+                return []   # truncated or malformed — silent, caller gets []
 
             # Normalise: AI sometimes returns bare list instead of {"results":[...]}
             if isinstance(parsed, list):

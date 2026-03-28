@@ -132,7 +132,13 @@ class BacktestingBot(BaseBot):
 
         dfs = {}
         for sym, bar_list in bars.items():
+            if not bar_list:
+                self.log(f"  {sym}: no bar data, skipping")
+                continue
             df = pd.DataFrame(bar_list)
+            if "close" not in df.columns or len(df) < 30:
+                self.log(f"  {sym}: insufficient data ({len(df)} bars), skipping")
+                continue
             df["timestamp"] = pd.to_datetime(df["timestamp"])
             df.set_index("timestamp", inplace=True)
             df.sort_index(inplace=True)
@@ -191,9 +197,18 @@ class BacktestingBot(BaseBot):
         target_pct = strategy.get("take_profit_pct", 0.04)
         size_pct   = strategy.get("position_size_pct", 0.10)
 
-        if df is None or len(df) == 0:
+        if df is None or len(df) == 0 or "close" not in df.columns:
             return {"trades": [], "equity": [initial_capital], "final_capital": initial_capital}
 
+        try:
+            return self._simulate_strategy_inner(df, strategy, initial_capital,
+                                                  stop_pct, target_pct, size_pct)
+        except Exception as e:
+            return {"trades": [], "equity": [initial_capital], "final_capital": initial_capital,
+                    "error": str(e)}
+
+    def _simulate_strategy_inner(self, df, strategy, initial_capital,
+                                  stop_pct, target_pct, size_pct):
         capital    = initial_capital
         position   = 0     # shares held
         entry_price = 0.0
