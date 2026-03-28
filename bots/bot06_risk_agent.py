@@ -157,23 +157,34 @@ class RiskAgent(BaseBot):
         reasons = []
         sym    = setup.get("symbol", "")
         dir_   = setup.get("direction", "long")
-        size   = setup.get("position_size_usd", 0)
         entry  = setup.get("entry_price", 0)
         sl     = setup.get("stop_loss", 0)
         tp     = setup.get("take_profit", 0)
 
-        # 1. Max position size
-        if size > RiskConfig.MAX_POSITION_SIZE:
-            reasons.append(
-                f"Position size ${size:,.0f} exceeds max ${RiskConfig.MAX_POSITION_SIZE:,.0f}"
-            )
+        # Always recalculate position size — never trust incoming value
+        # (Strategy Agent may send AI-generated sizes that exceed limits)
+        pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
+        if entry > 0 and sl > 0:
+            stop_distance = abs(entry - sl)
+            max_risk      = pv * 0.019                          # $19 on $1,000
+            shares        = int(max_risk / stop_distance) if stop_distance > 0 else 0
+            size          = min(shares * entry, 200.0)          # hard $200 cap
+        else:
+            size = 19.0   # safe fallback when entry/sl missing
 
-        # 2. Max portfolio risk per trade
-        if self._portfolio_value > 0 and entry > 0 and sl > 0:
+        # Write the corrected size back so downstream code and AI review see it
+        setup["position_size_usd"] = size
+
+        # 1. Max position size (now always ≤ $200, check is a safety net)
+        if size > 200.0:
+            reasons.append(f"Position size ${size:,.0f} exceeds max $200")
+
+        # 2. Portfolio risk check (uses our recalculated size, not AI's)
+        if entry > 0 and sl > 0:
             risk_per_share = abs(entry - sl)
-            shares         = size / entry
-            total_risk     = risk_per_share * shares
-            pct_risk       = total_risk / self._portfolio_value
+            shares_check   = size / entry if entry > 0 else 0
+            total_risk     = risk_per_share * shares_check
+            pct_risk       = total_risk / pv
             if pct_risk >= 0.025:   # reject at 2.5%+; allows up to 2.49%
                 reasons.append(
                     f"Trade risk {pct_risk*100:.2f}% exceeds max 2.5%"
