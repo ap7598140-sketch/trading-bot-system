@@ -140,7 +140,7 @@ class NewsSentimentBot(BaseBot):
                 None,
                 lambda: self.client.messages.create(
                     model=self.model,
-                    max_tokens=1024,
+                    max_tokens=2000,
                     messages=[{"role": "user", "content": prompt}],
                 ),
             )
