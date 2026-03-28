@@ -145,40 +145,97 @@ class NewsSentimentBot(BaseBot):
                 ),
             )
             raw = response.content[0].text.strip()
-            # Strip markdown code fences
-            raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
-            raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
-            # Extract first {...} block in case of extra prose
-            m = re.search(r"\{.*\}", raw, re.DOTALL)
-            raw = m.group(0) if m else raw
-            # Remove trailing commas before ] or }
+
+            # ── Robust JSON cleaning ────────────────────────────────────────
+            # 1. Strip all markdown code fences
+            raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
+            # 2. Remove // line comments and /* block comments */
+            raw = re.sub(r"//[^\n]*", "", raw)
+            raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
+            # 3. Fix Python/JS literals
+            raw = raw.replace("None", "null").replace("True", "true").replace("False", "false")
+            # 4. Remove trailing commas (two passes for nested structures)
             raw = re.sub(r",\s*([}\]])", r"\1", raw)
+            raw = re.sub(r",\s*([}\]])", r"\1", raw)
+            # 5. Bracket-tracking extraction of first complete {...} or [...]
+            raw = self._extract_json_block(raw)
+
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError as e:
-                self.log(f"Sentiment scoring JSON parse failed: {e}", "warning")
+                self.log(f"Sentiment JSON parse failed: {e}", "warning")
                 return []
+
+            # Normalise: AI sometimes returns bare list instead of {"results":[...]}
             if isinstance(parsed, list):
                 parsed = {"results": parsed}
-            results = {r["id"]: r for r in parsed.get("results", []) if "id" in r}
+            if not isinstance(parsed, dict):
+                return []
+
+            raw_results = parsed.get("results", [])
+            if not isinstance(raw_results, list):
+                return []
+
+            # Build id→result map, guarding against non-dict items
+            results = {
+                r["id"]: r
+                for r in raw_results
+                if isinstance(r, dict) and "id" in r
+            }
 
             scored = []
             for i, article in enumerate(articles):
+                if not isinstance(article, dict):
+                    continue
                 r = results.get(i, {})
+                if not isinstance(r, dict):
+                    r = {}
                 scored.append({
-                    "title":      article.get("title", ""),
-                    "url":        article.get("url", ""),
-                    "published":  article.get("publishedAt", ""),
-                    "sentiment":  r.get("sentiment", "neutral"),
-                    "score":      r.get("score", 0.5),
-                    "symbols":    r.get("symbols", article.get("_symbols", [])),
-                    "catalyst":   r.get("catalyst", ""),
+                    "title":     article.get("title", ""),
+                    "url":       article.get("url", ""),
+                    "published": article.get("publishedAt", ""),
+                    "sentiment": r.get("sentiment", "neutral"),
+                    "score":     r.get("score", 0.5),
+                    "symbols":   r.get("symbols", article.get("_symbols", [])),
+                    "catalyst":  r.get("catalyst", ""),
                 })
             return scored
 
         except Exception as e:
             self.log(f"Sentiment scoring error: {e}", "warning")
             return []
+
+    @staticmethod
+    def _extract_json_block(text: str) -> str:
+        """
+        Bracket-tracking extractor: finds the first complete {...} or [...]
+        block, correctly handles nested structures and quoted strings.
+        Falls back to original text if no complete block found.
+        """
+        for start_ch, end_ch in [('{', '}'), ('[', ']')]:
+            start = text.find(start_ch)
+            if start == -1:
+                continue
+            depth = 0
+            in_str = False
+            escape = False
+            for i, ch in enumerate(text[start:], start):
+                if escape:
+                    escape = False
+                    continue
+                if ch == '\\' and in_str:
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if ch == start_ch:
+                        depth += 1
+                    elif ch == end_ch:
+                        depth -= 1
+                        if depth == 0:
+                            return text[start:i + 1]
+        return text
 
     # ── Main cycle ─────────────────────────────────────────────────────────────
 

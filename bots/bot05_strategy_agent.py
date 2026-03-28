@@ -181,27 +181,20 @@ class StrategyAgent(BaseBot):
     async def _generate_trade_setups(self, signals: dict) -> list[dict]:
         """Use Sonnet to synthesise signals into actionable trade setups."""
 
-        # Refresh portfolio value from risk agent state
-        try:
-            risk_stats = await self.bus.get_state("bot6:stats") or {}
-            pv = risk_stats.get("portfolio_value", 0)
-            if pv:
-                self._portfolio_value = pv
-        except Exception:
-            pass
-        pv              = self._portfolio_value or 1000.0
-        max_risk_dollars = round(pv * RiskConfig.MAX_PORTFOLIO_RISK, 2)  # e.g. $20
-        max_notional     = round(pv * 0.20, 2)                           # e.g. $200
+        # Hardcoded account constraints — never derive from Alpaca portfolio value
+        # (paper account starts at $100,000 which would inflate all calculations)
+        PORTFOLIO    = 1000.0
+        MAX_POSITION = 200.0    # 20% of $1,000
+        MAX_RISK     = 19.0     # 1.9% of $1,000 (safely under the 2.5% gate)
 
         prompt = (
             "You are an expert stock trader synthesising real-time signals into trade setups.\n\n"
-            "POSITION SIZING RULES (hard constraints — this is a SMALL account):\n"
-            f"  • Portfolio value:        ${pv:,.2f}\n"
-            f"  • Max risk per trade:     {RiskConfig.MAX_PORTFOLIO_RISK*100:.1f}% = ${max_risk_dollars:.2f}\n"
-            f"  • Max position notional:  20% of portfolio = ${max_notional:.2f}  ← HARD CAP\n"
-            f"  • Sizing formula: shares = max_risk / stop_distance\n"
-            f"    Then cap: position_size_usd = min(shares * entry, ${max_notional:.2f})\n"
-            f"  • Example: entry=$200, stop=$196 ($4 stop) → shares=$20/$4=5 → size=$1,000 → capped at ${max_notional:.2f}\n"
+            "POSITION SIZING (HARD LIMITS — small $1,000 account):\n"
+            f"  • Max position_size_usd: ${MAX_POSITION:.0f}  ← absolute ceiling, never exceed\n"
+            f"  • Max risk per trade:    ${MAX_RISK:.0f}  (1.9% of portfolio)\n"
+            f"  • Sizing: shares = int({MAX_RISK:.0f} / stop_distance), "
+            f"then position_size_usd = min(shares * entry, {MAX_POSITION:.0f})\n"
+            f"  • Example: entry=$50, stop=$49 → shares=int(19/1)=19 → $950 → capped ${MAX_POSITION:.0f}\n"
             f"  • Stop loss: {RiskConfig.STOP_LOSS_PCT*100:.1f}% from entry\n"
             f"  • Take profit: {RiskConfig.TAKE_PROFIT_PCT*100:.1f}% from entry\n"
             f"  • Max open positions: {RiskConfig.MAX_OPEN_POSITIONS}\n\n"
@@ -209,7 +202,7 @@ class StrategyAgent(BaseBot):
             f"{json.dumps(signals, indent=2)}\n\n"
             "Generate up to 3 high-conviction trade setups. Each setup must include:\n"
             "  - symbol, direction (long/short), entry_price, stop_loss, take_profit\n"
-            f"  - position_size_usd (MUST be <= ${max_notional:.2f} — enforce the cap)\n"
+            f"  - position_size_usd (must be <= {MAX_POSITION:.0f})\n"
             "  - confidence (0-1), timeframe (scalp/intraday/swing)\n"
             "  - thesis (2-3 sentences explaining the confluence of signals)\n"
             "  - required_confirmations (list of conditions that must be met before entry)\n"
@@ -218,7 +211,7 @@ class StrategyAgent(BaseBot):
             "Respond ONLY with JSON:\n"
             "{\"setups\": [{\"symbol\": \"AAPL\", \"direction\": \"long\", "
             "\"entry_price\": 195.50, \"stop_loss\": 191.59, \"take_profit\": 203.32, "
-            "\"position_size_usd\": 200, \"confidence\": 0.78, "
+            f"\"position_size_usd\": {MAX_POSITION:.0f}, \"confidence\": 0.78, "
             "\"timeframe\": \"intraday\", \"thesis\": \"...\", "
             "\"required_confirmations\": [\"price above VWAP\", \"RSI > 55\"], "
             "\"risk_reward_ratio\": 2.0}], "
@@ -241,11 +234,16 @@ class StrategyAgent(BaseBot):
             parsed = json.loads(raw)
             setups = parsed.get("setups", [])
 
-            # Always enforce position sizing — never trust AI-generated values
+            # ALWAYS overwrite position_size_usd — never use Claude's value
             for s in setups:
+                ai_size = s.get("position_size_usd", "?")
                 s["position_size_usd"] = self._safe_position_size(
                     s.get("entry_price", 0),
                     s.get("stop_loss", 0),
+                )
+                self.log(
+                    f"Position size override: {s.get('symbol')} "
+                    f"AI=${ai_size} → enforced=${s['position_size_usd']}"
                 )
 
             return setups, parsed.get("market_bias", "neutral"), parsed.get("notes", "")
@@ -262,7 +260,8 @@ class StrategyAgent(BaseBot):
 
         signals = self._aggregate_signals()
 
-        if not signals["momentum"] and not signals["options"]:
+        # Skip only if ALL signal types are empty (1-signal threshold)
+        if not signals["momentum"] and not signals["options"] and not signals["news"]:
             self.log("Insufficient signals, skipping cycle")
             return
 
@@ -273,6 +272,10 @@ class StrategyAgent(BaseBot):
             self.log(f"No setups generated | market_bias={market_bias}")
         else:
             for setup in setups:
+                # Final hard cap — catches any edge case before hitting the wire
+                setup["position_size_usd"] = min(
+                    float(setup.get("position_size_usd", 19.0)), 200.0
+                )
                 await self.publish(RedisConfig.CHANNEL_STRATEGY, {
                     "type":         "trade_setup",
                     "market_bias":  market_bias,
