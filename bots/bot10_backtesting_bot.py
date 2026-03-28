@@ -191,6 +191,9 @@ class BacktestingBot(BaseBot):
         target_pct = strategy.get("take_profit_pct", 0.04)
         size_pct   = strategy.get("position_size_pct", 0.10)
 
+        if df is None or len(df) == 0:
+            return {"trades": [], "equity": [initial_capital], "final_capital": initial_capital}
+
         capital    = initial_capital
         position   = 0     # shares held
         entry_price = 0.0
@@ -252,7 +255,8 @@ class BacktestingBot(BaseBot):
 
             equity.append(capital + (position * price if in_trade else 0))
 
-        return {"trades": trades, "equity": equity, "final_capital": capital + position * df["close"].iloc[-1]}
+        last_price = df["close"].iloc[-1] if len(df) > 0 else 0.0
+        return {"trades": trades, "equity": equity, "final_capital": capital + position * last_price}
 
     def _eval_entry(self, row, strategy: dict) -> bool:
         rules = strategy.get("entry_rules", [])
@@ -316,7 +320,7 @@ class BacktestingBot(BaseBot):
                         if downside_std > 0 else 0)
 
         # Max drawdown
-        peak     = eq_arr[0]
+        peak     = eq_arr[0] if len(eq_arr) > 0 else 0.0
         max_dd   = 0.0
         for v in eq_arr:
             if v > peak:

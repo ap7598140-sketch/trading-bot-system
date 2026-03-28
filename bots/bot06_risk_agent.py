@@ -228,8 +228,8 @@ class RiskAgent(BaseBot):
                 reasons.append(f"Risk/reward {rr:.2f} below minimum 1.5")
 
         # 8. Confidence threshold
-        if setup.get("confidence", 0) < 0.55:
-            reasons.append(f"Confidence {setup.get('confidence'):.2f} below threshold 0.55")
+        if setup.get("confidence", 0) < 0.45:
+            reasons.append(f"Confidence {setup.get('confidence'):.2f} below threshold 0.45")
 
         return len(reasons) == 0, reasons
 
