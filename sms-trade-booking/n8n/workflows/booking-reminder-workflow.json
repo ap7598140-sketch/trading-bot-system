@@ -1,0 +1,93 @@
+{
+  "name": "Trade Bot — Booking Reminders",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "name": "Hourly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [240, 300],
+      "id": "1"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "readAll",
+        "documentId": "={{ $env.GOOGLE_SPREADSHEET_ID }}",
+        "sheetName": "Bookings",
+        "options": {}
+      },
+      "name": "Read Bookings Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "position": [460, 300],
+      "id": "2"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.Status }}",
+              "value2": "pending"
+            }
+          ]
+        }
+      },
+      "name": "Filter Pending Bookings",
+      "type": "n8n-nodes-base.if",
+      "position": [680, 300],
+      "id": "3"
+    },
+    {
+      "parameters": {
+        "jsCode": "const bookings = items;\nconst now = new Date();\nconst in24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);\n\nreturn bookings.filter(item => {\n  const bookingDate = new Date(`${item.json.PreferredDate} ${item.json.PreferredTime}`);\n  return bookingDate >= now && bookingDate <= in24h;\n});"
+      },
+      "name": "Filter Due Tomorrow",
+      "type": "n8n-nodes-base.code",
+      "position": [900, 300],
+      "id": "4"
+    },
+    {
+      "parameters": {
+        "from": "={{ $env.TWILIO_PHONE_NUMBER }}",
+        "to": "={{ $json.CustomerPhone }}",
+        "message": "Hi {{ $json.CustomerName }}! Reminder: you have an appointment for {{ $json.Service }} tomorrow at {{ $json.PreferredTime }}. Reply CONFIRM to confirm or CANCEL to cancel. — {{ $env.BUSINESS_NAME }}"
+      },
+      "name": "Send Reminder SMS",
+      "type": "n8n-nodes-base.twilio",
+      "position": [1120, 300],
+      "id": "5",
+      "credentials": {
+        "twilioApi": {
+          "id": "twilio-credentials",
+          "name": "Twilio API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Hourly Trigger": {
+      "main": [[ { "node": "Read Bookings Sheet", "type": "main", "index": 0 } ]]
+    },
+    "Read Bookings Sheet": {
+      "main": [[ { "node": "Filter Pending Bookings", "type": "main", "index": 0 } ]]
+    },
+    "Filter Pending Bookings": {
+      "main": [
+        [ { "node": "Filter Due Tomorrow", "type": "main", "index": 0 } ],
+        []
+      ]
+    },
+    "Filter Due Tomorrow": {
+      "main": [[ { "node": "Send Reminder SMS", "type": "main", "index": 0 } ]]
+    }
+  }
+}
