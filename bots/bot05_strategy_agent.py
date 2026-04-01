@@ -95,7 +95,7 @@ class StrategyAgent(BaseBot):
 
     # ── Position sizing ────────────────────────────────────────────────────────
 
-    def _safe_position_size(self, entry: float, stop_loss: float) -> float:
+    def _safe_position_size(self, entry, stop_loss) -> float:
         """
         Hardcoded for a $1,000 account:
           max_position = $200  (20% of $1,000)
@@ -105,6 +105,10 @@ class StrategyAgent(BaseBot):
         """
         max_position_usd = 200.0   # hard cap: 20% of $1,000
         max_risk_usd     = 19.0    # hard cap: 1.9% of $1,000
+
+        # Coerce None → 0 so comparisons never raise TypeError
+        entry     = float(entry or 0)
+        stop_loss = float(stop_loss or 0)
 
         if entry <= 0 or stop_loss <= 0:
             return max_risk_usd    # fallback: $19
@@ -238,8 +242,8 @@ class StrategyAgent(BaseBot):
             for s in setups:
                 ai_size = s.get("position_size_usd", "?")
                 s["position_size_usd"] = self._safe_position_size(
-                    s.get("entry_price", 0),
-                    s.get("stop_loss", 0),
+                    s.get("entry_price") or 0,
+                    s.get("stop_loss") or 0,
                 )
                 self.log(
                     f"Position size override: {s.get('symbol')} "
@@ -274,7 +278,7 @@ class StrategyAgent(BaseBot):
             for setup in setups:
                 # Final hard cap — catches any edge case before hitting the wire
                 setup["position_size_usd"] = min(
-                    float(setup.get("position_size_usd", 19.0)), 200.0
+                    float(setup.get("position_size_usd") or 19.0), 200.0
                 )
                 await self.publish(RedisConfig.CHANNEL_STRATEGY, {
                     "type":         "trade_setup",
