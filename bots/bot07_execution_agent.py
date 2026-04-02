@@ -61,6 +61,14 @@ class ExecutionAgent(BaseBot):
     async def _on_order_event(self, event: dict):
         event_type = event.get("type")
 
+        # Log every incoming event so we can see what arrives
+        self.log(
+            f"ORDER EVENT received: type={event_type} "
+            f"symbol={event.get('symbol')} "
+            f"size_usd={event.get('position_size_usd')} "
+            f"halted={self._trading_halted}"
+        )
+
         if event_type == "halt_trading":
             if self._trading_halted:
                 return   # already halted — ignore duplicates
@@ -87,14 +95,28 @@ class ExecutionAgent(BaseBot):
     # ── Trade execution ────────────────────────────────────────────────────────
 
     async def _execute_trade(self, setup: dict):
-        sym       = setup.get("symbol", "")
-        direction = setup.get("direction", "long")
-        size_usd  = setup.get("position_size_usd", 0)
-        entry     = setup.get("entry_price", 0)
+        sym        = setup.get("symbol", "")
+        direction  = setup.get("direction", "long")
+        size_usd   = setup.get("position_size_usd", 0)
+        entry      = setup.get("entry_price", 0)
         confidence = setup.get("confidence", 0.5)
 
+        # Log every field so we can diagnose incomplete setups
+        self.log(
+            f"EXECUTE_TRADE: sym={sym} dir={direction} "
+            f"size_usd={size_usd} entry={entry} "
+            f"stop={setup.get('stop_loss')} tp={setup.get('take_profit')} "
+            f"conf={confidence}"
+        )
+
         if not sym or not size_usd or not entry:
-            self.log(f"Incomplete trade setup: {setup}", "warning")
+            self.log(
+                f"REJECTED incomplete setup — missing: "
+                f"{'sym ' if not sym else ''}"
+                f"{'size_usd ' if not size_usd else ''}"
+                f"{'entry' if not entry else ''}",
+                "warning"
+            )
             return
 
         # Calculate share quantity
@@ -105,9 +127,8 @@ class ExecutionAgent(BaseBot):
         order_type = await self._decide_order_type(sym, entry, confidence, setup)
 
         self.log(
-            f"Executing: {side.upper()} {shares} {sym} @ "
-            f"{'MARKET' if order_type == 'market' else f'LIMIT ${entry:.2f}'} | "
-            f"conf={confidence:.2f}"
+            f"SENDING TO ALPACA: {side.upper()} {shares} shares of {sym} | "
+            f"type={order_type} entry=${entry} size_usd=${size_usd}"
         )
 
         try:
@@ -116,6 +137,9 @@ class ExecutionAgent(BaseBot):
                 None,
                 lambda: self.alpaca.submit_market_order(sym, shares, side),
             )
+
+            # Log full Alpaca response so we can see status, rejections, errors
+            self.log(f"ALPACA RESPONSE: {json.dumps(result, default=str)}")
 
             execution_record = {
                 "order_id":  result.get("id"),
