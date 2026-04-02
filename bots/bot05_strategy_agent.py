@@ -239,31 +239,44 @@ class StrategyAgent(BaseBot):
             setups = parsed.get("setups", [])
 
             # ALWAYS overwrite stop/take-profit and position size — never trust Claude's values
+            valid_setups = []
             for s in setups:
                 entry     = float(s.get("entry_price") or 0)
                 direction = (s.get("direction") or "long").lower()
 
-                # Calculate stop_loss and take_profit from entry price
-                if entry > 0:
-                    if direction == "long":
-                        s["stop_loss"]   = round(entry * 0.98, 4)
-                        s["take_profit"] = round(entry * 1.03, 4)
-                    else:  # short
-                        s["stop_loss"]   = round(entry * 1.02, 4)
-                        s["take_profit"] = round(entry * 0.97, 4)
+                # Skip setups with no entry price — nothing to calculate from
+                if entry <= 0:
+                    self.log(f"Dropped setup for {s.get('symbol')}: entry_price=0", "warning")
+                    continue
 
-                # Now recalculate position size using corrected stop_loss
+                # 2:1 reward-to-risk — always calculated, never from AI
+                if direction == "long":
+                    s["stop_loss"]   = round(entry * 0.98, 4)   # 2% risk
+                    s["take_profit"] = round(entry * 1.04, 4)   # 4% reward
+                else:  # short
+                    s["stop_loss"]   = round(entry * 1.02, 4)   # 2% risk
+                    s["take_profit"] = round(entry * 0.96, 4)   # 4% reward
+
+                # Recalculate position size using the corrected stop_loss
                 ai_size = s.get("position_size_usd", "?")
                 s["position_size_usd"] = self._safe_position_size(
                     entry,
-                    s.get("stop_loss") or 0,
-                )
-                self.log(
-                    f"Setup enforced: {s.get('symbol')} {direction} "
-                    f"entry={entry} sl={s.get('stop_loss')} tp={s.get('take_profit')} "
-                    f"size AI=${ai_size} → ${s['position_size_usd']}"
+                    s["stop_loss"],
                 )
 
+                # Final guard — never send a setup missing critical fields
+                if not s.get("stop_loss") or not s.get("take_profit"):
+                    self.log(f"Dropped setup for {s.get('symbol')}: sl/tp still zero", "warning")
+                    continue
+
+                self.log(
+                    f"Setup enforced: {s.get('symbol')} {direction} "
+                    f"entry={entry} sl={s['stop_loss']} tp={s['take_profit']} "
+                    f"size AI=${ai_size} → ${s['position_size_usd']}"
+                )
+                valid_setups.append(s)
+
+            setups = valid_setups
             return setups, parsed.get("market_bias", "neutral"), parsed.get("notes", "")
         except Exception as e:
             self.log(f"Strategy generation error: {e}", "error")
