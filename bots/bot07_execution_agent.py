@@ -85,7 +85,7 @@ class ExecutionAgent(BaseBot):
             self.log(f"Trading halted – ignoring {event_type} for {event.get('symbol')}", "warning")
             return
 
-        if event_type == "approved_trade":
+        if event_type in ("approved_trade", "trade_setup"):
             await self._execute_trade(event)
         elif event_type == "force_close":
             await self._force_close(event.get("symbol"), event.get("reason", ""))
