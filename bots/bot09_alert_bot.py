@@ -291,10 +291,13 @@ class AlertBot(BaseBot):
     async def _telegram_buy(self, data: dict):
         """Format and send a BUY notification to Telegram."""
         sym        = data.get("symbol", "?")
-        price      = data.get("price") or data.get("limit_price")
+        direction  = (data.get("direction") or data.get("side") or "long").upper()
+        price      = data.get("entry_price") or data.get("entry") or data.get("price")
         confidence = data.get("confidence")
-        reason     = data.get("reason") or data.get("signal", "")
+        reason     = data.get("reason") or data.get("thesis") or data.get("signal", "")
         risk_pct   = data.get("risk_pct") or data.get("portfolio_risk_pct")
+        stop_loss  = data.get("stop_loss")
+        take_profit = data.get("take_profit")
         shares     = data.get("shares") or data.get("qty")
 
         # Record entry so we can compute P&L on close
@@ -305,17 +308,25 @@ class AlertBot(BaseBot):
                 "shares":      shares,
             }
 
-        price_str      = f"${price:,.2f}" if price else "market"
-        confidence_str = f"{round(confidence * 100)}%" if confidence else "N/A"
-        risk_str       = f"{round(risk_pct * 100, 1)}%" if risk_pct else "N/A"
-        reason_str     = str(reason)[:80] if reason else "N/A"
+        price_str  = f"${float(price):,.2f}" if price else "market"
+        conf_str   = f"{round(float(confidence) * 100)}%" if confidence is not None else "N/A"
+        risk_str   = f"{round(float(risk_pct) * 100, 1)}%" if risk_pct else "1.9%"
+        sl_str     = f"${float(stop_loss):,.2f}" if stop_loss else "N/A"
+        tp_str     = f"${float(take_profit):,.2f}" if take_profit else "N/A"
+        reason_str = str(reason)[:100] if reason else "N/A"
+
+        # Use BUY for long/buy, SELL label only for shorts initiated as sells
+        icon  = "🟢" if direction in ("LONG", "BUY") else "🔴"
+        label = "BUY" if direction in ("LONG", "BUY") else "SHORT"
 
         text = (
-            f"🟢 <b>BUY {sym}</b>\n"
+            f"{icon} <b>{label} {sym}</b>\n"
             f"Price: {price_str}\n"
-            f"Confidence: {confidence_str}\n"
-            f"Reason: {reason_str}\n"
-            f"Risk: {risk_str}"
+            f"Confidence: {conf_str}\n"
+            f"Risk: {risk_str}\n"
+            f"Stop Loss: {sl_str}\n"
+            f"Take Profit: {tp_str}\n"
+            f"Reason: {reason_str}"
         )
         await self._send_telegram(text)
 

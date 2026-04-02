@@ -142,17 +142,20 @@ class ExecutionAgent(BaseBot):
             self.log(f"ALPACA RESPONSE: {json.dumps(result, default=str)}")
 
             execution_record = {
-                "order_id":  result.get("id"),
-                "symbol":    sym,
-                "side":      side,
-                "shares":    shares,
-                "size_usd":  size_usd,
-                "entry":     entry,
-                "stop_loss": setup.get("stop_loss"),
+                "order_id":    result.get("id"),
+                "symbol":      sym,
+                "side":        side,
+                "direction":   direction,
+                "shares":      shares,
+                "size_usd":    size_usd,
+                "entry_price": entry,
+                "stop_loss":   setup.get("stop_loss"),
                 "take_profit": setup.get("take_profit"),
-                "status":    result.get("status"),
-                "timestamp": datetime.utcnow().isoformat(),
-                "thesis":    setup.get("thesis", "")[:120],
+                "confidence":  confidence,
+                "risk_pct":    round(size_usd / 1000 * 0.019, 4) if size_usd else 0.019,
+                "reason":      setup.get("thesis") or setup.get("notes", ""),
+                "status":      result.get("status"),
+                "timestamp":   datetime.utcnow().isoformat(),
             }
 
             self._executions_today.append(execution_record)
