@@ -129,7 +129,7 @@ class StrategyAgent(BaseBot):
         # Top momentum candidates
         top_momentum = sorted(
             [s for s in self._momentum_signals if s.get("direction") != "neutral"],
-            key=lambda x: x.get("score", 0.5),
+            key=lambda x: x.get("score") or 0.5,
             reverse=True
         )[:10]
 
@@ -238,16 +238,30 @@ class StrategyAgent(BaseBot):
             parsed = json.loads(raw)
             setups = parsed.get("setups", [])
 
-            # ALWAYS overwrite position_size_usd — never use Claude's value
+            # ALWAYS overwrite stop/take-profit and position size — never trust Claude's values
             for s in setups:
+                entry     = float(s.get("entry_price") or 0)
+                direction = (s.get("direction") or "long").lower()
+
+                # Calculate stop_loss and take_profit from entry price
+                if entry > 0:
+                    if direction == "long":
+                        s["stop_loss"]   = round(entry * 0.98, 4)
+                        s["take_profit"] = round(entry * 1.03, 4)
+                    else:  # short
+                        s["stop_loss"]   = round(entry * 1.02, 4)
+                        s["take_profit"] = round(entry * 0.97, 4)
+
+                # Now recalculate position size using corrected stop_loss
                 ai_size = s.get("position_size_usd", "?")
                 s["position_size_usd"] = self._safe_position_size(
-                    s.get("entry_price") or 0,
+                    entry,
                     s.get("stop_loss") or 0,
                 )
                 self.log(
-                    f"Position size override: {s.get('symbol')} "
-                    f"AI=${ai_size} → enforced=${s['position_size_usd']}"
+                    f"Setup enforced: {s.get('symbol')} {direction} "
+                    f"entry={entry} sl={s.get('stop_loss')} tp={s.get('take_profit')} "
+                    f"size AI=${ai_size} → ${s['position_size_usd']}"
                 )
 
             return setups, parsed.get("market_bias", "neutral"), parsed.get("notes", "")
