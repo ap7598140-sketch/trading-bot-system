@@ -12,6 +12,7 @@ Role   : System orchestrator and supreme decision authority.
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone, time as dt_time
 from typing import Optional
 import pytz
@@ -229,16 +230,36 @@ class MasterCommander(BaseBot):
                 None,
                 lambda: self.client.messages.create(
                     model=self.model,
-                    max_tokens=500,
+                    max_tokens=2000,
                     messages=[{"role": "user", "content": prompt}],
                 ),
             )
             raw = response.content[0].text.strip()
-            if "```" in raw:
-                raw = raw.split("```")[1].lstrip("json").strip()
+            # Robust cleaning: strip fences, comments, trailing commas
+            raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
+            raw = re.sub(r"//[^\n]*", "", raw)
+            raw = re.sub(r",\s*([}\]])", r"\1", raw)
+            raw = re.sub(r",\s*([}\]])", r"\1", raw)
+            # Bracket-tracking extraction of first complete {...}
+            start = raw.find("{")
+            if start != -1:
+                depth, in_str, escape, end = 0, False, False, -1
+                for i, ch in enumerate(raw[start:], start):
+                    if escape: escape = False; continue
+                    if ch == "\\" and in_str: escape = True; continue
+                    if ch == '"': in_str = not in_str
+                    elif not in_str:
+                        if ch == "{": depth += 1
+                        elif ch == "}":
+                            depth -= 1
+                            if depth == 0: end = i; break
+                if end != -1:
+                    raw = raw[start:end + 1]
             return json.loads(raw)
+        except json.JSONDecodeError:
+            pass   # silent fallback below
         except Exception as e:
-            self.log(f"AI command review error: {e}", "error")
+            self.log(f"AI command review error: {e}", "warning")
             return {
                 "trading_allowed": not self._system_halted,
                 "session_action":  "continue",

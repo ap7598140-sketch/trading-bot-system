@@ -119,6 +119,23 @@ class ExecutionAgent(BaseBot):
             )
             return
 
+        # Buying power check before placing order
+        try:
+            loop    = asyncio.get_event_loop()
+            account = await loop.run_in_executor(None, self.alpaca.get_account)
+            buying_power = float(account.get("buying_power", 0))
+            cost_basis   = float(size_usd)
+            if buying_power < cost_basis:
+                self.log(
+                    f"SKIPPED {sym}: insufficient buying power "
+                    f"(${buying_power:,.2f} available, ${cost_basis:,.2f} needed)",
+                    "warning"
+                )
+                return
+            self.log(f"Buying power OK: ${buying_power:,.2f} available for ${cost_basis:,.2f} order")
+        except Exception as e:
+            self.log(f"Buying power check failed: {e} — proceeding anyway", "warning")
+
         # Calculate share quantity
         shares = max(1, int(size_usd / entry))
         side   = "buy" if direction == "long" else "sell"
