@@ -207,6 +207,24 @@ class DataAgent(BaseBot):
     async def cleanup(self):
         self.log("Data Agent stopped")
 
+    # ── Connection retry helper ────────────────────────────────────────────────
+
+    async def _retry(self, fn, label: str, retries: int = 3, delay: float = 5.0):
+        """Run a sync callable in executor; retry up to `retries` times on connection errors."""
+        loop = asyncio.get_event_loop()
+        for attempt in range(1, retries + 1):
+            try:
+                return await loop.run_in_executor(None, fn)
+            except (ConnectionResetError, TimeoutError, OSError) as e:
+                if attempt < retries:
+                    self.log(f"{label} connection error (attempt {attempt}/{retries}): {e} — retrying in {delay}s", "warning")
+                    await asyncio.sleep(delay)
+                else:
+                    self.log(f"{label} failed after {retries} attempts: {e}", "warning")
+                    raise
+            except Exception:
+                raise   # non-connection errors bubble up immediately
+
     # ── Cache warm-up ──────────────────────────────────────────────────────────
 
     async def _warm_cache(self):
@@ -214,9 +232,9 @@ class DataAgent(BaseBot):
         self.log("Warming bar cache…")
         start = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
         try:
-            bars = await asyncio.get_event_loop().run_in_executor(
-                None,
+            bars = await self._retry(
                 lambda: self.alpaca.get_bars(self.symbols, TimeFrame.Day, start),
+                "get_bars(warm_cache)",
             )
             for sym, bar_list in bars.items():
                 self._bar_cache[sym] = bar_list
@@ -227,19 +245,26 @@ class DataAgent(BaseBot):
     # ── Refresh cycle ──────────────────────────────────────────────────────────
 
     async def _refresh_cycle(self):
-        loop = asyncio.get_event_loop()
-
         # 1. Latest quotes (real-time bid/ask)
-        quotes = await loop.run_in_executor(
-            None, lambda: self.alpaca.get_latest_quotes(self.symbols)
-        )
+        today_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
+        try:
+            quotes = await self._retry(
+                lambda: self.alpaca.get_latest_quotes(self.symbols),
+                "get_latest_quotes",
+            )
+        except Exception as e:
+            self.log(f"Quotes fetch failed, skipping cycle: {e}", "warning")
+            return
 
         # 2. Today's 1-min bars for intraday indicators
-        today_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
-        intraday = await loop.run_in_executor(
-            None,
-            lambda: self.alpaca.get_bars(self.symbols, TimeFrame.Minute, today_start),
-        )
+        try:
+            intraday = await self._retry(
+                lambda: self.alpaca.get_bars(self.symbols, TimeFrame.Minute, today_start),
+                "get_bars(intraday)",
+            )
+        except Exception as e:
+            self.log(f"Intraday bars fetch failed, skipping cycle: {e}", "warning")
+            return
 
         # 3. Build enriched packets per symbol
         packets = []

@@ -89,15 +89,32 @@ class RiskAgent(BaseBot):
             return "pre_market"
         return "closed"
 
+    # ── Connection retry helper ────────────────────────────────────────────────
+
+    async def _retry(self, fn, label: str, retries: int = 3, delay: float = 5.0):
+        """Run a sync callable in executor; retry up to `retries` times on connection errors."""
+        loop = asyncio.get_event_loop()
+        for attempt in range(1, retries + 1):
+            try:
+                return await loop.run_in_executor(None, fn)
+            except (ConnectionResetError, TimeoutError, OSError) as e:
+                if attempt < retries:
+                    self.log(f"{label} connection error (attempt {attempt}/{retries}): {e} — retrying in {delay}s", "warning")
+                    await asyncio.sleep(delay)
+                else:
+                    self.log(f"{label} failed after {retries} attempts: {e}", "warning")
+                    raise
+            except Exception:
+                raise   # non-connection errors bubble up immediately
+
     # ── Portfolio refresh ──────────────────────────────────────────────────────
 
     async def _refresh_portfolio(self):
-        loop = asyncio.get_event_loop()
         try:
-            account   = await loop.run_in_executor(None, self.alpaca.get_account)
-            positions = await loop.run_in_executor(None, self.alpaca.get_positions)
-            self._portfolio_value  = account["portfolio_value"]
-            self._open_positions   = positions
+            account   = await self._retry(self.alpaca.get_account,   "get_account")
+            positions = await self._retry(self.alpaca.get_positions,  "get_positions")
+            self._portfolio_value = account["portfolio_value"]
+            self._open_positions  = positions
             self._daily_pnl = sum(p["unrealized_pl"] for p in positions)
         except Exception as e:
             self.log(f"Portfolio refresh error: {e}", "warning")
