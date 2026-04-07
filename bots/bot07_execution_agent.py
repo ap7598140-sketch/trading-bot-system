@@ -11,14 +11,18 @@ Role   : Order router and trade executor.
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
+
+import pytz
 
 import anthropic
 
 from config import Models, RedisConfig, AnthropicConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
+
+MARKET_TZ = pytz.timezone("America/New_York")
 
 
 class ExecutionAgent(BaseBot):
@@ -45,6 +49,7 @@ class ExecutionAgent(BaseBot):
         await self.bus.subscribe(RedisConfig.CHANNEL_ORDERS, self._on_order_event)
         asyncio.create_task(self.bus.listen())
         asyncio.create_task(self._order_monitor())
+        asyncio.create_task(self._eod_cancel_task())
         self.log("Execution Agent starting")
 
     async def run(self):
@@ -253,6 +258,28 @@ class ExecutionAgent(BaseBot):
             self.log("All pending orders cancelled")
         except Exception as e:
             self.log(f"Cancel all failed: {e}", "error")
+
+    # ── EOD order cancel ───────────────────────────────────────────────────────
+
+    async def _eod_cancel_task(self):
+        """Cancel all pending orders at 3:55pm EST every trading day."""
+        while self.running:
+            now_et = datetime.now(MARKET_TZ)
+            target = now_et.replace(hour=15, minute=55, second=0, microsecond=0)
+            if now_et >= target:
+                target += timedelta(days=1)
+            sleep_secs = (target - now_et).total_seconds()
+            self.log(f"EOD order cancel scheduled in {sleep_secs / 60:.1f} min")
+            await asyncio.sleep(sleep_secs)
+            # Skip weekends
+            if datetime.now(MARKET_TZ).weekday() >= 5:
+                continue
+            self.log("EOD 3:55pm — cancelling all pending orders before close")
+            await self._cancel_all_pending()
+            await self.publish(RedisConfig.CHANNEL_ALERTS, {
+                "type":      "eod_orders_cancelled",
+                "timestamp": datetime.utcnow().isoformat(),
+            })
 
     # ── Order monitor ──────────────────────────────────────────────────────────
 

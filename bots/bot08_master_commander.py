@@ -13,13 +13,14 @@ Role   : System orchestrator and supreme decision authority.
 import asyncio
 import json
 import re
-from datetime import datetime, timezone, time as dt_time
+from datetime import datetime, timezone, time as dt_time, timedelta
 from typing import Optional
 import pytz
 
 import anthropic
+import httpx
 
-from config import Models, RedisConfig, AnthropicConfig, RiskConfig
+from config import Models, RedisConfig, AnthropicConfig, RiskConfig, AlertConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 
@@ -92,6 +93,7 @@ class MasterCommander(BaseBot):
         await self.bus.subscribe(RedisConfig.CHANNEL_RISK,      self._on_risk_update)
         await self.bus.subscribe(RedisConfig.CHANNEL_ALERTS,    self._on_alert)
         asyncio.create_task(self.bus.listen())
+        asyncio.create_task(self._eod_close_task())
         await self._refresh_portfolio()
         self._session_start_val = self._portfolio_value
         self.log(
@@ -295,6 +297,108 @@ class MasterCommander(BaseBot):
             "daily_pnl":      self._daily_pnl,
             "market_session": self._market_session,
             "system_halted":  self._system_halted,
+        })
+
+    # ── Telegram ───────────────────────────────────────────────────────────────
+
+    async def _send_telegram(self, text: str):
+        """Send a Telegram message directly from Master Commander."""
+        token   = AlertConfig.TELEGRAM_BOT_TOKEN
+        chat_id = AlertConfig.TELEGRAM_CHAT_ID
+        if not token or not chat_id:
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(url, json={
+                    "chat_id":    chat_id,
+                    "text":       text,
+                    "parse_mode": "HTML",
+                })
+                if resp.status_code != 200:
+                    self.log(f"Telegram send failed: {resp.status_code}", "warning")
+        except Exception as e:
+            self.log(f"Telegram error: {e}", "warning")
+
+    # ── End-of-day position close ──────────────────────────────────────────────
+
+    async def _eod_close_task(self):
+        """Close all positions at 3:55pm EST every trading day."""
+        while self.running:
+            now_et = datetime.now(MARKET_TZ)
+            target = now_et.replace(hour=15, minute=55, second=0, microsecond=0)
+            if now_et >= target:
+                target += timedelta(days=1)
+            sleep_secs = (target - now_et).total_seconds()
+            self.log(f"EOD position close scheduled in {sleep_secs / 60:.1f} min")
+            await asyncio.sleep(sleep_secs)
+            # Skip weekends
+            if datetime.now(MARKET_TZ).weekday() >= 5:
+                continue
+            await self._run_eod_close()
+
+    async def _run_eod_close(self):
+        """Execute EOD close: fetch positions, close each, send Telegram summary, reset counter."""
+        self.log("EOD 3:55pm — closing all positions")
+        loop = asyncio.get_event_loop()
+
+        # Fetch open positions before closing
+        try:
+            positions = await loop.run_in_executor(None, self.alpaca.get_positions)
+        except Exception as e:
+            self.log(f"EOD: failed to fetch positions: {e}", "error")
+            positions = []
+
+        # Close each position individually to capture P/L
+        closed: list[dict] = []
+        total_pnl = 0.0
+        for pos in positions:
+            sym = pos["symbol"]
+            pnl = float(pos.get("unrealized_pl", 0.0))
+            try:
+                await loop.run_in_executor(None, lambda s=sym: self.alpaca.close_position(s))
+                closed.append({"symbol": sym, "pnl": pnl})
+                total_pnl += pnl
+                sign = "+" if pnl >= 0 else ""
+                self.log(f"EOD closed {sym}: {sign}${pnl:.2f}")
+            except Exception as e:
+                self.log(f"EOD close failed for {sym}: {e}", "warning")
+
+        # Fallback if positions list was empty
+        if not positions:
+            try:
+                await loop.run_in_executor(None, self.alpaca.close_all_positions)
+                self.log("EOD: close_all_positions executed (no open positions found)")
+            except Exception as e:
+                self.log(f"EOD close_all fallback failed: {e}", "warning")
+
+        # Reset daily trade counter
+        self._real_trades_today = 0
+        self.log("EOD: daily trade counter reset to 0")
+
+        # Build Telegram message
+        lines = ["🔔 <b>END OF DAY CLOSE</b>",
+                 "Closed all positions at 3:55pm", ""]
+        if closed:
+            lines.append("<b>Positions closed:</b>")
+            for c in closed:
+                sign = "+" if c["pnl"] >= 0 else ""
+                lines.append(f"  - {c['symbol']}: {sign}${c['pnl']:.2f}")
+            lines.append("")
+        else:
+            lines.append("No open positions to close.")
+            lines.append("")
+        sign = "+" if total_pnl >= 0 else ""
+        lines.append(f"<b>Total P/L today: {sign}${total_pnl:.2f}</b>")
+
+        await self._send_telegram("\n".join(lines))
+
+        # Publish EOD event so other bots can react
+        await self.publish(RedisConfig.CHANNEL_ALERTS, {
+            "type":      "eod_positions_closed",
+            "positions": closed,
+            "total_pnl": total_pnl,
+            "timestamp": datetime.utcnow().isoformat(),
         })
 
     # ── Command cycle ──────────────────────────────────────────────────────────
