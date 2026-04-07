@@ -346,20 +346,23 @@ class MasterCommander(BaseBot):
             await self._run_eod_close()
 
     async def _run_eod_close(self):
-        """Execute EOD close: fetch positions, close each, send Telegram summary, reset counter."""
-        self.log("EOD 3:55pm — closing all positions")
+        """
+        EOD close: fetch ALL positions, close every one, verify none remain,
+        retry any stragglers, then send Telegram summary.
+        """
+        self.log("EOD 3:55pm — starting end-of-day position close")
         loop = asyncio.get_event_loop()
 
-        # Fetch open positions before closing
+        # ── Pass 1: fetch and close every position ─────────────────────────
         try:
             positions = await loop.run_in_executor(None, self.alpaca.get_positions)
         except Exception as e:
             self.log(f"EOD: failed to fetch positions: {e}", "error")
             positions = []
 
-        # Close each position individually to capture P/L
         closed: list[dict] = []
         total_pnl = 0.0
+
         for pos in positions:
             sym = pos["symbol"]
             pnl = float(pos.get("unrealized_pl", 0.0))
@@ -372,19 +375,59 @@ class MasterCommander(BaseBot):
             except Exception as e:
                 self.log(f"EOD close failed for {sym}: {e}", "warning")
 
-        # Fallback if positions list was empty
-        if not positions:
-            try:
-                await loop.run_in_executor(None, self.alpaca.close_all_positions)
-                self.log("EOD: close_all_positions executed (no open positions found)")
-            except Exception as e:
-                self.log(f"EOD close_all fallback failed: {e}", "warning")
+        # ── Wait 5 s then verify ────────────────────────────────────────────
+        await asyncio.sleep(5)
 
-        # Reset daily trade counter
+        try:
+            remaining = await loop.run_in_executor(None, self.alpaca.get_positions)
+        except Exception as e:
+            self.log(f"EOD: verification fetch failed: {e}", "warning")
+            remaining = []
+
+        # ── Pass 2: retry any positions still open ──────────────────────────
+        if remaining:
+            self.log(
+                f"EOD: {len(remaining)} position(s) still open after pass 1 — retrying: "
+                f"{[p['symbol'] for p in remaining]}",
+                "warning",
+            )
+            for pos in remaining:
+                sym = pos["symbol"]
+                pnl = float(pos.get("unrealized_pl", 0.0))
+                try:
+                    await loop.run_in_executor(None, lambda s=sym: self.alpaca.close_position(s))
+                    # Update P/L if already recorded (duplicate position), otherwise append
+                    existing = next((c for c in closed if c["symbol"] == sym), None)
+                    if existing:
+                        existing["pnl"] += pnl
+                        total_pnl += pnl
+                    else:
+                        closed.append({"symbol": sym, "pnl": pnl})
+                        total_pnl += pnl
+                    sign = "+" if pnl >= 0 else ""
+                    self.log(f"EOD retry closed {sym}: {sign}${pnl:.2f}")
+                except Exception as e:
+                    self.log(f"EOD retry close failed for {sym}: {e}", "warning")
+
+            # Final verification
+            await asyncio.sleep(3)
+            try:
+                still_open = await loop.run_in_executor(None, self.alpaca.get_positions)
+                if still_open:
+                    syms = [p["symbol"] for p in still_open]
+                    self.log(f"EOD: WARNING — {len(still_open)} position(s) could not be closed: {syms}", "warning")
+                else:
+                    self.log("EOD: all positions confirmed closed after retry")
+            except Exception as e:
+                self.log(f"EOD: final verification failed: {e}", "warning")
+        else:
+            self.log("EOD: all positions confirmed closed")
+
+        # ── Reset daily trade counter ───────────────────────────────────────
         self._real_trades_today = 0
         self.log("EOD: daily trade counter reset to 0")
 
-        # Build Telegram message
+        # ── Build and send Telegram summary ────────────────────────────────
         lines = ["🔔 <b>END OF DAY CLOSE</b>",
                  "Closed all positions at 3:55pm", ""]
         if closed:
