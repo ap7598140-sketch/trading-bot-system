@@ -79,6 +79,7 @@ class MasterCommander(BaseBot):
         self._total_commands    = 0
         self._real_trades_today = 0       # submitted orders; halt requires >= 10
         self._halt_ignored_logged = False # log "ignoring halt" warning only once
+        self._consecutive_losses  = 0    # incremented on stop_loss_triggered, reset on market open
 
         # Aggregated signals
         self._risk_stats:      dict = {}
@@ -151,7 +152,11 @@ class MasterCommander(BaseBot):
 
         elif alert_type == "stop_loss_triggered":
             sym = data.get("symbol")
-            self.log(f"Stop loss triggered: {sym} | pnl={data.get('pnl_pct')}%", "warning")
+            self._consecutive_losses += 1
+            self.log(
+                f"Stop loss triggered: {sym} | pnl={data.get('pnl_pct')}% | "
+                f"consecutive_losses={self._consecutive_losses}", "warning"
+            )
 
     # ── Portfolio ──────────────────────────────────────────────────────────────
 
@@ -210,18 +215,21 @@ class MasterCommander(BaseBot):
             "You are the Master Commander of an AI trading system. "
             "Review the system state and issue commands.\n\n"
             f"SYSTEM STATE:\n{json.dumps(system_state, indent=2)}\n\n"
+            "IMPORTANT RULES:\n"
+            "- NEVER recommend halt or pause because data feeds (strategy/momentum/news) are empty. "
+            "Empty data feeds are normal — bots update on their own schedule.\n"
+            "- ONLY recommend halt if daily_pnl_pct is worse than -3.0% (financial loss only).\n"
+            "- Default session_action to 'continue' unless there is a clear financial emergency.\n\n"
             "Assess:\n"
-            "1. Should trading continue, pause, or halt? Why?\n"
+            "1. Are risk levels acceptable based on portfolio P/L only?\n"
             "2. Are there any bots that appear to be malfunctioning?\n"
-            "3. Is the current market session appropriate for active trading?\n"
-            "4. Are risk levels acceptable?\n"
-            "5. Any strategic adjustments needed?\n\n"
+            "3. Any strategic adjustments needed?\n\n"
             "Respond ONLY with JSON:\n"
             "{\"trading_allowed\": true, "
             "\"confidence\": 0.85, "
             "\"commands\": [\"string\"], "
             "\"risk_level\": \"low|medium|high|critical\", "
-            "\"session_action\": \"continue|pause|halt|close_all\", "
+            "\"session_action\": \"continue|close_all\", "
             "\"notes\": \"brief commentary\", "
             "\"alert_operator\": false, "
             "\"operator_message\": \"\"}"
@@ -429,6 +437,7 @@ class MasterCommander(BaseBot):
                     self.log("Market opened – trading resumed")
                 self._real_trades_today    = 0     # reset daily counter each open
                 self._halt_ignored_logged  = False # allow one warning next pre-market
+                self._consecutive_losses   = 0     # reset loss streak each day
 
         # Bot health
         bot_health = self._check_bot_health()
@@ -463,34 +472,51 @@ class MasterCommander(BaseBot):
             "news":            self._news_summary,
         }
 
-        # AI review (only during market_open to save API calls and prevent pre-market halts)
-        if self._market_session == "open":
-            decision = await self._ai_command_review(system_state)
+        # ── Hard-coded halt rules (never based on data feed availability) ──────
+        if self._market_session == "open" and not self._system_halted:
+            daily_pnl_pct = system_state.get("daily_pnl_pct", 0)
+            if daily_pnl_pct < -2.0:
+                await self._emergency_halt(
+                    f"Portfolio down {daily_pnl_pct:.1f}% — exceeds 2% daily loss limit"
+                )
+            elif self._consecutive_losses > 5:
+                await self._emergency_halt(
+                    f"Halted after {self._consecutive_losses} consecutive stop-loss triggers"
+                )
 
-            # Apply AI commands
-            session_action = decision.get("session_action", "continue")
-            if session_action == "halt" and not self._system_halted:
-                await self._emergency_halt(decision.get("notes", "AI commanded halt"))
-            elif session_action == "close_all":
-                self.log("AI commanded: close all positions", "warning")
-                loop = asyncio.get_event_loop()
-                try:
-                    await loop.run_in_executor(None, self.alpaca.close_all_positions)
-                except Exception as e:
-                    self.log(f"Close all failed: {e}", "error")
-            elif session_action == "pause" and not self._system_halted:
-                await self._emergency_halt("Commander paused trading")
+        # ── AI review — only when data feeds have actual content ─────────────
+        if self._market_session == "open" and not self._system_halted:
+            data_available = any([
+                self._strategy_state,
+                self._momentum_board,
+                self._news_summary,
+                self._risk_stats,
+            ])
+            if not data_available:
+                self.log("Data feeds empty — skipping AI review, will retry next cycle", "warning")
+            else:
+                decision = await self._ai_command_review(system_state)
 
-            if decision.get("alert_operator") and decision.get("operator_message"):
-                await self.publish(RedisConfig.CHANNEL_ALERTS, {
-                    "type":    "operator_alert",
-                    "message": decision["operator_message"],
-                    "risk_level": decision.get("risk_level", "medium"),
-                })
+                # AI may only trigger close_all (not halt/pause — those are hard-coded above)
+                session_action = decision.get("session_action", "continue")
+                if session_action == "close_all":
+                    self.log("AI commanded: close all positions", "warning")
+                    loop = asyncio.get_event_loop()
+                    try:
+                        await loop.run_in_executor(None, self.alpaca.close_all_positions)
+                    except Exception as e:
+                        self.log(f"Close all failed: {e}", "error")
 
-            risk_level = decision.get("risk_level", "medium")
-            system_state["commander_risk_level"] = risk_level
-            system_state["commander_notes"]      = decision.get("notes", "")
+                if decision.get("alert_operator") and decision.get("operator_message"):
+                    await self.publish(RedisConfig.CHANNEL_ALERTS, {
+                        "type":       "operator_alert",
+                        "message":    decision["operator_message"],
+                        "risk_level": decision.get("risk_level", "medium"),
+                    })
+
+                risk_level = decision.get("risk_level", "medium")
+                system_state["commander_risk_level"] = risk_level
+                system_state["commander_notes"]      = decision.get("notes", "")
 
         # Save dashboard state (for external monitoring)
         await self.save_state("dashboard", system_state, ttl=60)
