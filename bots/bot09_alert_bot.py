@@ -24,6 +24,7 @@ import anthropic
 
 from config import Models, RedisConfig, AlertConfig, AnthropicConfig
 from shared.base_bot import BaseBot
+from shared.alpaca_client import AlpacaClient
 
 
 # Alert severity levels
@@ -65,6 +66,7 @@ class AlertBot(BaseBot):
     def __init__(self):
         super().__init__(self.BOT_ID, self.NAME, Models.HAIKU)
         self.client = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
+        self.alpaca = AlpacaClient()
 
         self._alert_history: list[dict]       = []
         self._last_sent: dict[str, datetime]  = {}   # alert_type → last_sent time
@@ -98,13 +100,21 @@ class AlertBot(BaseBot):
     async def _send_startup_notification(self):
         """Send a Telegram message when the system comes online."""
         try:
+            # Read real portfolio value from Alpaca first; fall back to Redis state
             portfolio_value = 0.0
             try:
-                risk_stats = await self.bus.get_state("bot6:stats") or {}
-                portfolio_value = risk_stats.get("portfolio_value", 0.0)
+                loop    = asyncio.get_event_loop()
+                account = await loop.run_in_executor(None, self.alpaca.get_account)
+                portfolio_value = float(account.get("portfolio_value", 0))
             except Exception:
                 pass
-            pv_str = f"${portfolio_value:,.2f}" if portfolio_value else "$1,000.00"
+            if not portfolio_value:
+                try:
+                    risk_stats = await self.bus.get_state("bot6:stats") or {}
+                    portfolio_value = float(risk_stats.get("portfolio_value", 0))
+                except Exception:
+                    pass
+            pv_str = f"${portfolio_value:,.2f}" if portfolio_value else "unavailable"
 
             import pytz
             et = pytz.timezone("America/New_York")

@@ -17,6 +17,7 @@ import anthropic
 
 from config import Models, RedisConfig, RiskConfig, AnthropicConfig
 from shared.base_bot import BaseBot
+from shared.alpaca_client import AlpacaClient
 
 
 DECISION_DEBOUNCE = 600  # min seconds between decision cycles (10 min)
@@ -34,6 +35,7 @@ class StrategyAgent(BaseBot):
     def __init__(self):
         super().__init__(self.BOT_ID, self.NAME, Models.SONNET)
         self.client = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
+        self.alpaca = AlpacaClient()
 
         # Signal buffers (reset each decision cycle)
         self._market_data: dict[str, dict]  = {}
@@ -41,7 +43,7 @@ class StrategyAgent(BaseBot):
         self._momentum_signals: list[dict]   = []
         self._options_signals: list[dict]    = []
         self._last_decision: datetime | None = None  # debounce for event-driven cycles
-        self._portfolio_value: float         = 0.0   # synced from risk agent state
+        self._portfolio_value: float         = 0.0   # refreshed from Alpaca each cycle
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -51,7 +53,8 @@ class StrategyAgent(BaseBot):
         await self.bus.subscribe(RedisConfig.CHANNEL_MOMENTUM,     self._on_momentum)
         await self.bus.subscribe(RedisConfig.CHANNEL_OPTIONS_FLOW, self._on_options)
         asyncio.create_task(self.bus.listen())
-        self.log("Strategy Agent starting")
+        await self._refresh_portfolio()
+        self.log(f"Strategy Agent starting | portfolio=${self._portfolio_value:,.2f}")
 
     async def run(self):
         # Keep alive; decisions fire event-driven from _on_market_data
@@ -93,29 +96,42 @@ class StrategyAgent(BaseBot):
         if len(self._options_signals) > 30:
             self._options_signals = self._options_signals[-30:]
 
+    # ── Portfolio refresh ──────────────────────────────────────────────────────
+
+    async def _refresh_portfolio(self):
+        """Read real portfolio value from Alpaca."""
+        try:
+            loop    = asyncio.get_event_loop()
+            account = await loop.run_in_executor(None, self.alpaca.get_account)
+            self._portfolio_value = float(account["portfolio_value"])
+            self.log(f"Portfolio value refreshed: ${self._portfolio_value:,.2f}")
+        except Exception as e:
+            self.log(f"Portfolio refresh error: {e} — keeping ${self._portfolio_value:,.2f}", "warning")
+
     # ── Position sizing ────────────────────────────────────────────────────────
 
     def _safe_position_size(self, entry, stop_loss) -> float:
         """
-        Hardcoded for a $1,000 account:
-          max_position = $200  (20% of $1,000)
-          max_risk     = $19   (1.9% of $1,000 — safely under the 2% gate)
-          shares       = int($19 / stop_distance)   ← whole shares only
-          position_usd = min(shares * entry, $200)  ← hard $200 cap
+        Size based on real Alpaca portfolio value:
+          max_position = 20% of portfolio
+          max_risk     = 1.9% of portfolio (safely under the 2.5% risk gate)
+          shares       = int(max_risk / stop_distance)  ← whole shares only
+          position_usd = min(shares * entry, max_position)
         """
-        max_position_usd = 200.0   # hard cap: 20% of $1,000
-        max_risk_usd     = 19.0    # hard cap: 1.9% of $1,000
+        pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
+        max_position_usd = pv * 0.20    # 20% of real portfolio
+        max_risk_usd     = pv * 0.019   # 1.9% of real portfolio
 
         # Coerce None → 0 so comparisons never raise TypeError
         entry     = float(entry or 0)
         stop_loss = float(stop_loss or 0)
 
         if entry <= 0 or stop_loss <= 0:
-            return max_risk_usd    # fallback: $19
+            return round(max_risk_usd, 2)
 
         stop_distance = abs(entry - stop_loss)
         if stop_distance <= 0:
-            return max_risk_usd
+            return round(max_risk_usd, 2)
 
         shares       = int(max_risk_usd / stop_distance)   # whole shares, truncated
         position_usd = min(shares * entry, max_position_usd)
@@ -185,20 +201,19 @@ class StrategyAgent(BaseBot):
     async def _generate_trade_setups(self, signals: dict) -> list[dict]:
         """Use Sonnet to synthesise signals into actionable trade setups."""
 
-        # Hardcoded account constraints — never derive from Alpaca portfolio value
-        # (paper account starts at $100,000 which would inflate all calculations)
-        PORTFOLIO    = 1000.0
-        MAX_POSITION = 200.0    # 20% of $1,000
-        MAX_RISK     = 19.0     # 1.9% of $1,000 (safely under the 2.5% gate)
+        # Use real portfolio value — refreshed from Alpaca before this cycle
+        PORTFOLIO    = self._portfolio_value if self._portfolio_value > 0 else 1000.0
+        MAX_POSITION = round(PORTFOLIO * 0.20, 2)   # 20% of real portfolio
+        MAX_RISK     = round(PORTFOLIO * 0.019, 2)  # 1.9% of real portfolio
 
         prompt = (
             "You are an expert stock trader synthesising real-time signals into trade setups.\n\n"
-            "POSITION SIZING (HARD LIMITS — small $1,000 account):\n"
-            f"  • Max position_size_usd: ${MAX_POSITION:.0f}  ← absolute ceiling, never exceed\n"
-            f"  • Max risk per trade:    ${MAX_RISK:.0f}  (1.9% of portfolio)\n"
-            f"  • Sizing: shares = int({MAX_RISK:.0f} / stop_distance), "
-            f"then position_size_usd = min(shares * entry, {MAX_POSITION:.0f})\n"
-            f"  • Example: entry=$50, stop=$49 → shares=int(19/1)=19 → $950 → capped ${MAX_POSITION:.0f}\n"
+            f"POSITION SIZING (HARD LIMITS — ${PORTFOLIO:,.0f} account):\n"
+            f"  • Max position_size_usd: ${MAX_POSITION:,.0f}  ← absolute ceiling, never exceed\n"
+            f"  • Max risk per trade:    ${MAX_RISK:,.0f}  (1.9% of portfolio)\n"
+            f"  • Sizing: shares = int({MAX_RISK:,.0f} / stop_distance), "
+            f"then position_size_usd = min(shares * entry, {MAX_POSITION:,.0f})\n"
+            f"  • Example: entry=$50, stop=$49 → shares=int({MAX_RISK:,.0f}/1)={int(MAX_RISK)} → capped ${MAX_POSITION:,.0f}\n"
             f"  • Stop loss: {RiskConfig.STOP_LOSS_PCT*100:.1f}% from entry\n"
             f"  • Take profit: {RiskConfig.TAKE_PROFIT_PCT*100:.1f}% from entry\n"
             f"  • Max open positions: {RiskConfig.MAX_OPEN_POSITIONS}\n\n"
@@ -206,7 +221,7 @@ class StrategyAgent(BaseBot):
             f"{json.dumps(signals, indent=2)}\n\n"
             "Generate up to 3 high-conviction trade setups. Each setup must include:\n"
             "  - symbol, direction (long/short), entry_price, stop_loss, take_profit\n"
-            f"  - position_size_usd (must be <= {MAX_POSITION:.0f})\n"
+            f"  - position_size_usd (must be <= {MAX_POSITION:,.0f})\n"
             "  - confidence (0-1), timeframe (scalp/intraday/swing)\n"
             "  - thesis (2-3 sentences explaining the confluence of signals)\n"
             "  - required_confirmations (list of conditions that must be met before entry)\n"
@@ -215,7 +230,7 @@ class StrategyAgent(BaseBot):
             "Respond ONLY with JSON:\n"
             "{\"setups\": [{\"symbol\": \"AAPL\", \"direction\": \"long\", "
             "\"entry_price\": 195.50, \"stop_loss\": 191.59, \"take_profit\": 203.32, "
-            f"\"position_size_usd\": {MAX_POSITION:.0f}, \"confidence\": 0.78, "
+            f"\"position_size_usd\": {MAX_POSITION:,.0f}, \"confidence\": 0.78, "
             "\"timeframe\": \"intraday\", \"thesis\": \"...\", "
             "\"required_confirmations\": [\"price above VWAP\", \"RSI > 55\"], "
             "\"risk_reward_ratio\": 2.0}], "
@@ -289,6 +304,7 @@ class StrategyAgent(BaseBot):
             self.log("No market data yet")
             return
 
+        await self._refresh_portfolio()
         signals = self._aggregate_signals()
 
         # Skip only if ALL signal types are empty (1-signal threshold)
@@ -302,10 +318,12 @@ class StrategyAgent(BaseBot):
         if not setups:
             self.log(f"No setups generated | market_bias={market_bias}")
         else:
+            pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
+            max_pos_cap = pv * 0.20
             for setup in setups:
                 # Final hard cap — catches any edge case before hitting the wire
                 setup["position_size_usd"] = min(
-                    float(setup.get("position_size_usd") or 19.0), 200.0
+                    float(setup.get("position_size_usd") or pv * 0.019), max_pos_cap
                 )
                 await self.publish(RedisConfig.CHANNEL_STRATEGY, {
                     "type":         "trade_setup",
