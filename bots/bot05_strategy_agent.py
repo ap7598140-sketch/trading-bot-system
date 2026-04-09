@@ -119,8 +119,8 @@ class StrategyAgent(BaseBot):
           position_usd = min(shares * entry, max_position)
         """
         pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-        max_position_usd = pv * 0.20    # 20% of real portfolio
-        max_risk_usd     = pv * 0.019   # 1.9% of real portfolio
+        max_position_usd = min(pv * 0.25, RiskConfig.MAX_SINGLE_POSITION_USD)  # 25% of portfolio, cap $1,000
+        max_risk_usd     = pv * 0.01    # 1% of real portfolio
 
         # Coerce None → 0 so comparisons never raise TypeError
         entry     = float(entry or 0)
@@ -203,20 +203,20 @@ class StrategyAgent(BaseBot):
 
         # Use real portfolio value — refreshed from Alpaca before this cycle
         PORTFOLIO    = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-        MAX_POSITION = round(PORTFOLIO * 0.20, 2)   # 20% of real portfolio
-        MAX_RISK     = round(PORTFOLIO * 0.019, 2)  # 1.9% of real portfolio
+        MAX_POSITION = min(round(PORTFOLIO * 0.25, 2), RiskConfig.MAX_SINGLE_POSITION_USD)
+        MAX_RISK     = round(PORTFOLIO * 0.01, 2)   # 1% of real portfolio
 
         prompt = (
             "You are an expert stock trader synthesising real-time signals into trade setups.\n\n"
             f"POSITION SIZING (HARD LIMITS — ${PORTFOLIO:,.0f} account):\n"
             f"  • Max position_size_usd: ${MAX_POSITION:,.0f}  ← absolute ceiling, never exceed\n"
-            f"  • Max risk per trade:    ${MAX_RISK:,.0f}  (1.9% of portfolio)\n"
+            f"  • Max risk per trade:    ${MAX_RISK:,.0f}  (1% of portfolio)\n"
             f"  • Sizing: shares = int({MAX_RISK:,.0f} / stop_distance), "
             f"then position_size_usd = min(shares * entry, {MAX_POSITION:,.0f})\n"
-            f"  • Example: entry=$50, stop=$49 → shares=int({MAX_RISK:,.0f}/1)={int(MAX_RISK)} → capped ${MAX_POSITION:,.0f}\n"
-            f"  • Stop loss: {RiskConfig.STOP_LOSS_PCT*100:.1f}% from entry\n"
-            f"  • Take profit: {RiskConfig.TAKE_PROFIT_PCT*100:.1f}% from entry\n"
-            f"  • Max open positions: {RiskConfig.MAX_OPEN_POSITIONS}\n\n"
+            f"  • Stop loss: {RiskConfig.STOP_LOSS_PCT*100:.0f}% from entry\n"
+            f"  • Take profit: {RiskConfig.TAKE_PROFIT_PCT*100:.0f}% from entry  (2:1 reward/risk)\n"
+            f"  • Max open positions: {RiskConfig.MAX_OPEN_POSITIONS}\n"
+            f"  • Max trades per day: {RiskConfig.MAX_DAILY_TRADES}\n\n"
             "SIGNALS:\n"
             f"{json.dumps(signals, indent=2)}\n\n"
             "Generate up to 3 high-conviction trade setups. Each setup must include:\n"
@@ -266,11 +266,11 @@ class StrategyAgent(BaseBot):
 
                 # 2:1 reward-to-risk — always calculated, never from AI
                 if direction == "long":
-                    s["stop_loss"]   = round(entry * 0.98, 4)   # 2% risk
-                    s["take_profit"] = round(entry * 1.04, 4)   # 4% reward
+                    s["stop_loss"]   = round(entry * 0.99, 4)   # 1% risk
+                    s["take_profit"] = round(entry * 1.02, 4)   # 2% reward
                 else:  # short
-                    s["stop_loss"]   = round(entry * 1.02, 4)   # 2% risk
-                    s["take_profit"] = round(entry * 0.96, 4)   # 4% reward
+                    s["stop_loss"]   = round(entry * 1.01, 4)   # 1% risk
+                    s["take_profit"] = round(entry * 0.98, 4)   # 2% reward
 
                 # Recalculate position size using the corrected stop_loss
                 ai_size = s.get("position_size_usd", "?")
@@ -319,11 +319,11 @@ class StrategyAgent(BaseBot):
             self.log(f"No setups generated | market_bias={market_bias}")
         else:
             pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-            max_pos_cap = pv * 0.20
+            max_pos_cap = min(pv * 0.25, RiskConfig.MAX_SINGLE_POSITION_USD)
             for setup in setups:
                 # Final hard cap — catches any edge case before hitting the wire
                 setup["position_size_usd"] = min(
-                    float(setup.get("position_size_usd") or pv * 0.019), max_pos_cap
+                    float(setup.get("position_size_usd") or pv * 0.01), max_pos_cap
                 )
                 await self.publish(RedisConfig.CHANNEL_STRATEGY, {
                     "type":         "trade_setup",

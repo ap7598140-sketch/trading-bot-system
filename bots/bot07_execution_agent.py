@@ -18,7 +18,7 @@ import pytz
 
 import anthropic
 
-from config import Models, RedisConfig, AnthropicConfig
+from config import Models, RedisConfig, AnthropicConfig, RiskConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 
@@ -40,6 +40,8 @@ class ExecutionAgent(BaseBot):
         self.alpaca = AlpacaClient()
 
         self._trading_halted = False
+        self._no_new_buys   = False   # True after 3:50pm — blocks new buy orders only
+        self._trades_today  = 0       # resets at market open; capped at MAX_DAILY_TRADES
         self._pending_orders: dict[str, dict] = {}    # order_id → order info
         self._executions_today: list[dict] = []
 
@@ -50,6 +52,7 @@ class ExecutionAgent(BaseBot):
         asyncio.create_task(self.bus.listen())
         asyncio.create_task(self._order_monitor())
         asyncio.create_task(self._eod_cancel_task())
+        asyncio.create_task(self._eod_no_buys_task())
         self.log("Execution Agent starting")
 
     async def run(self):
@@ -124,6 +127,21 @@ class ExecutionAgent(BaseBot):
             )
             return
 
+        side = "buy" if direction == "long" else "sell"
+
+        # After 3:50pm block new buy orders (EOD wind-down)
+        if self._no_new_buys and side == "buy":
+            self.log(f"SKIPPED {sym}: no new buys after 3:50pm EST", "warning")
+            return
+
+        # Daily trade limit
+        if self._trades_today >= RiskConfig.MAX_DAILY_TRADES:
+            self.log(
+                f"SKIPPED {sym}: daily trade limit reached ({self._trades_today}/{RiskConfig.MAX_DAILY_TRADES})",
+                "warning"
+            )
+            return
+
         # Buying power check before placing order
         try:
             loop    = asyncio.get_event_loop()
@@ -143,7 +161,6 @@ class ExecutionAgent(BaseBot):
 
         # Calculate share quantity
         shares = max(1, int(size_usd / entry))
-        side   = "buy" if direction == "long" else "sell"
 
         # AI order routing: market vs limit
         order_type = await self._decide_order_type(sym, entry, confidence, setup)
@@ -181,6 +198,7 @@ class ExecutionAgent(BaseBot):
             }
 
             self._executions_today.append(execution_record)
+            self._trades_today += 1
             if result.get("id"):
                 self._pending_orders[result["id"]] = execution_record
 
@@ -189,7 +207,10 @@ class ExecutionAgent(BaseBot):
                 **execution_record,
             })
 
-            self.log(f"Order submitted: {result.get('id')} | status={result.get('status')}")
+            self.log(
+                f"Order submitted: {result.get('id')} | status={result.get('status')} | "
+                f"trades today={self._trades_today}/{RiskConfig.MAX_DAILY_TRADES}"
+            )
 
         except Exception as e:
             self.log(f"Order submission failed: {sym} – {e}", "error")
@@ -258,6 +279,32 @@ class ExecutionAgent(BaseBot):
             self.log("All pending orders cancelled")
         except Exception as e:
             self.log(f"Cancel all failed: {e}", "error")
+
+    # ── EOD buy block (3:50pm) ─────────────────────────────────────────────────
+
+    async def _eod_no_buys_task(self):
+        """Block new buy orders after 3:50pm EST; re-enable at next market open (9:30am)."""
+        while self.running:
+            now_et = datetime.now(MARKET_TZ)
+            target = now_et.replace(hour=15, minute=50, second=0, microsecond=0)
+            if now_et >= target:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now_et).total_seconds())
+            if datetime.now(MARKET_TZ).weekday() >= 5:
+                continue
+            self._no_new_buys = True
+            self.log("EOD 3:50pm — new buy orders blocked until next market open")
+            # Re-enable at next 9:30am ET (skip weekends)
+            now_et     = datetime.now(MARKET_TZ)
+            next_open  = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            if now_et >= next_open:
+                next_open += timedelta(days=1)
+            while next_open.weekday() >= 5:
+                next_open += timedelta(days=1)
+            await asyncio.sleep((next_open - datetime.now(MARKET_TZ)).total_seconds())
+            self._no_new_buys  = False
+            self._trades_today = 0
+            self.log("Market open — buy orders re-enabled, daily trade counter reset")
 
     # ── EOD order cancel ───────────────────────────────────────────────────────
 

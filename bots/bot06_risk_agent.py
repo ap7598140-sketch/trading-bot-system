@@ -181,8 +181,8 @@ class RiskAgent(BaseBot):
         # Always recalculate position size — never trust incoming value
         # (Strategy Agent may send AI-generated sizes that exceed limits)
         pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-        max_position = pv * 0.20    # 20% of real portfolio
-        max_risk     = pv * 0.019   # 1.9% of real portfolio
+        max_position = min(pv * 0.25, RiskConfig.MAX_SINGLE_POSITION_USD)  # 25% of portfolio, hard $1,000 cap
+        max_risk     = pv * 0.01    # 1% of real portfolio
         if entry > 0 and sl > 0:
             stop_distance = abs(entry - sl)
             shares        = int(max_risk / stop_distance) if stop_distance > 0 else 0
@@ -195,7 +195,7 @@ class RiskAgent(BaseBot):
 
         # 1. Max position size check
         if size > max_position:
-            reasons.append(f"Position size ${size:,.0f} exceeds max ${max_position:,.0f} (20% of portfolio)")
+            reasons.append(f"Position size ${size:,.0f} exceeds max ${max_position:,.0f}")
 
         # 2. Portfolio risk check (uses our recalculated size, not AI's)
         if entry > 0 and sl > 0:

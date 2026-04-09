@@ -80,6 +80,8 @@ class MasterCommander(BaseBot):
         self._real_trades_today = 0       # submitted orders; halt requires >= 10
         self._halt_ignored_logged = False # log "ignoring halt" warning only once
         self._consecutive_losses  = 0    # incremented on stop_loss_triggered, reset on market open
+        self._wins_today          = 0    # positions closed at take-profit
+        self._losses_today        = 0    # positions closed at stop-loss
 
         # Aggregated signals
         self._risk_stats:      dict = {}
@@ -153,10 +155,15 @@ class MasterCommander(BaseBot):
         elif alert_type == "stop_loss_triggered":
             sym = data.get("symbol")
             self._consecutive_losses += 1
+            self._losses_today += 1
             self.log(
                 f"Stop loss triggered: {sym} | pnl={data.get('pnl_pct')}% | "
                 f"consecutive_losses={self._consecutive_losses}", "warning"
             )
+
+        elif alert_type == "take_profit":
+            self._wins_today += 1
+            self._consecutive_losses = 0  # reset streak on a winner
 
     # ── Portfolio ──────────────────────────────────────────────────────────────
 
@@ -423,24 +430,38 @@ class MasterCommander(BaseBot):
         else:
             self.log("EOD: all positions confirmed closed")
 
+        # ── Tally EOD closed positions into win/loss counters ───────────────
+        for c in closed:
+            if c["pnl"] > 0:
+                self._wins_today   += 1
+            elif c["pnl"] < 0:
+                self._losses_today += 1
+
         # ── Reset daily trade counter ───────────────────────────────────────
+        total_trades = self._real_trades_today
         self._real_trades_today = 0
         self.log("EOD: daily trade counter reset to 0")
 
+        # ── Refresh portfolio for accurate closing value ────────────────────
+        await self._refresh_portfolio()
+
         # ── Build and send Telegram summary ────────────────────────────────
-        lines = ["🔔 <b>END OF DAY CLOSE</b>",
-                 "Closed all positions at 3:55pm", ""]
+        pnl_sign  = "+" if total_pnl >= 0 else ""
+        pv_str    = f"${self._portfolio_value:,.2f}" if self._portfolio_value else "N/A"
+
+        lines = ["🔔 <b>END OF DAY SUMMARY</b>", ""]
+        lines.append(f"Total trades today: {total_trades}")
+        lines.append(f"Winning trades: {self._wins_today}")
+        lines.append(f"Losing trades:  {self._losses_today}")
+        lines.append("")
         if closed:
             lines.append("<b>Positions closed:</b>")
             for c in closed:
                 sign = "+" if c["pnl"] >= 0 else ""
                 lines.append(f"  - {c['symbol']}: {sign}${c['pnl']:.2f}")
             lines.append("")
-        else:
-            lines.append("No open positions to close.")
-            lines.append("")
-        sign = "+" if total_pnl >= 0 else ""
-        lines.append(f"<b>Total P/L today: {sign}${total_pnl:.2f}</b>")
+        lines.append(f"<b>Total P/L: {pnl_sign}${total_pnl:.2f}</b>")
+        lines.append(f"<b>Portfolio value: {pv_str}</b>")
 
         await self._send_telegram("\n".join(lines))
 
@@ -481,6 +502,8 @@ class MasterCommander(BaseBot):
                 self._real_trades_today    = 0     # reset daily counter each open
                 self._halt_ignored_logged  = False # allow one warning next pre-market
                 self._consecutive_losses   = 0     # reset loss streak each day
+                self._wins_today           = 0
+                self._losses_today         = 0
 
         # Bot health
         bot_health = self._check_bot_health()

@@ -55,13 +55,15 @@ class RedisConfig:
 
 # ── Risk limits ────────────────────────────────────────────────────────────────
 class RiskConfig:
-    MAX_POSITION_SIZE   = float(os.getenv("MAX_POSITION_SIZE", "10000"))
-    MAX_PORTFOLIO_RISK  = float(os.getenv("MAX_PORTFOLIO_RISK", "0.025"))  # 2.5% per trade
-    MAX_DAILY_LOSS      = 0.05    # 5% daily loss limit
-    MAX_OPEN_POSITIONS  = 10
-    STOP_LOSS_PCT       = 0.02    # 2% stop loss
-    TAKE_PROFIT_PCT     = 0.04    # 4% take profit
-    MAX_SECTOR_EXPOSURE = 0.30    # 30% in any one sector
+    MAX_POSITION_SIZE       = float(os.getenv("MAX_POSITION_SIZE", "10000"))
+    MAX_PORTFOLIO_RISK      = float(os.getenv("MAX_PORTFOLIO_RISK", "0.025"))
+    MAX_DAILY_LOSS          = 0.05    # 5% daily loss limit
+    MAX_OPEN_POSITIONS      = 8       # max simultaneous open positions
+    MAX_DAILY_TRADES        = 10      # max orders submitted per day
+    MAX_SINGLE_POSITION_USD = 1000.0  # hard $1,000 cap per individual trade
+    STOP_LOSS_PCT           = 0.01    # 1% stop loss
+    TAKE_PROFIT_PCT         = 0.02    # 2% take profit  →  2:1 reward/risk
+    MAX_SECTOR_EXPOSURE     = 0.30    # 30% in any one sector
 
 
 # ── Trading universe ───────────────────────────────────────────────────────────
