@@ -21,9 +21,12 @@ import pandas as pd
 
 from alpaca.data.timeframe import TimeFrame
 
+import pytz
 from config import Models, RedisConfig, UniverseConfig, AnthropicConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
+
+MARKET_TZ = pytz.timezone("America/New_York")
 
 
 # ── JSON cleaning helper ───────────────────────────────────────────────────────
@@ -189,11 +192,13 @@ class DataAgent(BaseBot):
         self.symbols = list(dict.fromkeys(UniverseConfig.WATCHLIST))   # deduplicated
         self._bar_cache: dict[str, list[dict]] = {}   # rolling bar history
         self._last_ai_scan: datetime | None = None   # throttle AI scan to 10-min intervals
+        self._morning_scan_done: bool = False   # runs once per day at 9am
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def setup(self):
         self.log(f"Data Agent starting | watching {len(self.symbols)} symbols")
+        asyncio.create_task(self._morning_scan_task())
         await self._warm_cache()
 
     async def run(self):
@@ -224,6 +229,144 @@ class DataAgent(BaseBot):
                     raise
             except Exception:
                 raise   # non-connection errors bubble up immediately
+
+    # ── 9am Morning scan (runs ONCE per day) ──────────────────────────────────
+
+    async def _morning_scan_task(self):
+        """Sleep until 9:00am EST, run one market-wide scan, then wait until next day."""
+        while self.running:
+            now_et = datetime.now(MARKET_TZ)
+            target = now_et.replace(hour=9, minute=0, second=0, microsecond=0)
+            if now_et >= target:
+                target += timedelta(days=1)
+            self.log(f"Morning scan scheduled in {(target - now_et).total_seconds()/60:.1f} min")
+            await asyncio.sleep((target - now_et).total_seconds())
+            if datetime.now(MARKET_TZ).weekday() >= 5:
+                continue
+            self._morning_scan_done = False
+            await self._run_morning_scan()
+            self._morning_scan_done = True
+
+    async def _run_morning_scan(self):
+        """
+        One-shot 9am scan using Alpaca FREE data only:
+          1. Fetch 2-day bars for the full SCAN_UNIVERSE
+          2. Rank by volume, % change, and gap
+          3. Claude Haiku picks TOP 20 best opportunities
+          4. Save results to Redis for all other bots to read
+        """
+        scan_symbols = list(dict.fromkeys(UniverseConfig.SCAN_UNIVERSE))
+        self.log(f"Morning scan starting | {len(scan_symbols)} symbols in universe")
+
+        start = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+        try:
+            bars = await self._retry(
+                lambda: self.alpaca.get_bars(scan_symbols, TimeFrame.Day, start),
+                "morning_scan_bars",
+            )
+        except Exception as e:
+            self.log(f"Morning scan bars failed: {e}", "warning")
+            return
+
+        # Compute per-symbol metrics (no AI cost here — pure math)
+        candidates = []
+        for sym, bar_list in bars.items():
+            if len(bar_list) < 2:
+                continue
+            prev = bar_list[-2]
+            curr = bar_list[-1]
+            if prev["close"] <= 0:
+                continue
+            pct_change = (curr["close"] - prev["close"]) / prev["close"] * 100
+            gap_pct    = (curr["open"]  - prev["close"]) / prev["close"] * 100
+            vol_ratio  = curr["volume"] / max(prev["volume"], 1)
+            candidates.append({
+                "symbol":     sym,
+                "price":      round(curr["close"], 2),
+                "pct_change": round(pct_change, 2),
+                "gap_pct":    round(gap_pct, 2),
+                "volume":     int(curr["volume"]),
+                "vol_ratio":  round(vol_ratio, 2),
+            })
+
+        # Sort by combined signal strength: |% change| + vol_ratio + |gap|
+        candidates.sort(
+            key=lambda x: abs(x["pct_change"]) + x["vol_ratio"] + abs(x["gap_pct"]),
+            reverse=True,
+        )
+        top_raw = candidates[:30]   # send top 30 to AI to choose best 20
+
+        # Flag gap stocks (≥2% gap up or down)
+        gap_ups   = [c["symbol"] for c in candidates if c["gap_pct"] >= 2.0]
+        gap_downs = [c["symbol"] for c in candidates if c["gap_pct"] <= -2.0]
+        self.log(
+            f"Morning scan raw: {len(candidates)} symbols | "
+            f"gap up {len(gap_ups)} | gap down {len(gap_downs)}"
+        )
+
+        # Claude AI picks top 20 opportunities (ONE call, Haiku — cheap)
+        opportunities = await self._ai_morning_analysis(top_raw, gap_ups, gap_downs)
+
+        # Save to Redis — all bots read this for the day
+        await self.save_state("morning_scan", {
+            "opportunities": opportunities,
+            "gap_ups":        gap_ups[:10],
+            "gap_downs":      gap_downs[:10],
+            "top_by_volume":  sorted(candidates, key=lambda x: x["volume"], reverse=True)[:10],
+            "scanned":        len(candidates),
+            "timestamp":      datetime.utcnow().isoformat(),
+        }, ttl=3600 * 8)   # keep for 8 hours
+
+        # Publish each top pick as a flagged market_data event
+        for opp in opportunities:
+            await self.publish(RedisConfig.CHANNEL_MARKET_DATA, {
+                "type":    "morning_pick",
+                "symbol":  opp.get("symbol"),
+                "direction": opp.get("direction", "long"),
+                "reason":  opp.get("reason", ""),
+                "priority": opp.get("priority", "medium"),
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+
+        self.log(f"Morning scan complete | {len(opportunities)} AI picks published")
+
+    async def _ai_morning_analysis(self, candidates: list[dict],
+                                   gap_ups: list[str], gap_downs: list[str]) -> list[dict]:
+        """ONE Claude Haiku call to pick the top 20 opportunities from raw scan data."""
+        prompt = (
+            "You are a momentum trader scanning the market at 9am. "
+            "Select the TOP 20 best trading opportunities for today.\n\n"
+            f"Top candidates by momentum score:\n{json.dumps(candidates, indent=2)}\n\n"
+            f"Stocks gapping UP ≥2%:   {gap_ups}\n"
+            f"Stocks gapping DOWN ≥2%: {gap_downs}\n\n"
+            "Prioritize: large % moves with volume confirmation, clean gaps, high vol_ratio.\n"
+            "For each pick include: symbol, direction (long/short), reason (1 sentence), "
+            "priority (high/medium/low).\n\n"
+            "Respond ONLY with JSON:\n"
+            "{\"opportunities\": ["
+            "{\"symbol\": \"NVDA\", \"direction\": \"long\", "
+            "\"reason\": \"Gap up 3.2% on high volume — breakout continuation likely\", "
+            "\"priority\": \"high\"}"
+            "]}"
+        )
+        try:
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.client.messages.create(
+                    model=self.model,
+                    max_tokens=2000,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+            )
+            raw    = _clean_llm_json(response.content[0].text.strip())
+            parsed = json.loads(raw)
+            return parsed.get("opportunities", [])[:20]
+        except Exception as e:
+            self.log(f"Morning AI analysis error: {e}", "warning")
+            # Fallback: return top 20 raw candidates as long picks
+            return [{"symbol": c["symbol"], "direction": "long",
+                     "reason": f"pct={c['pct_change']:+.1f}% vol_ratio={c['vol_ratio']:.1f}x",
+                     "priority": "medium"} for c in candidates[:20]]
 
     # ── Cache warm-up ──────────────────────────────────────────────────────────
 

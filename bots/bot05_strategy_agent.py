@@ -10,14 +10,17 @@ Role   : The brain that synthesises ALL input signals into concrete trade setups
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import anthropic
 
-from config import Models, RedisConfig, RiskConfig, AnthropicConfig
+import pytz
+from config import Models, RedisConfig, RiskConfig, AnthropicConfig, UniverseConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
+
+MARKET_TZ = pytz.timezone("America/New_York")
 
 
 DECISION_DEBOUNCE = 600  # min seconds between decision cycles (10 min)
@@ -44,6 +47,8 @@ class StrategyAgent(BaseBot):
         self._options_signals: list[dict]    = []
         self._last_decision: datetime | None = None  # debounce for event-driven cycles
         self._portfolio_value: float         = 0.0   # refreshed from Alpaca each cycle
+        self._strongest_sector: str          = ""    # set at 9am, used all day
+        self._sector_symbols: list[str]      = []    # symbols in strongest sector
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -53,6 +58,7 @@ class StrategyAgent(BaseBot):
         await self.bus.subscribe(RedisConfig.CHANNEL_MOMENTUM,     self._on_momentum)
         await self.bus.subscribe(RedisConfig.CHANNEL_OPTIONS_FLOW, self._on_options)
         asyncio.create_task(self.bus.listen())
+        asyncio.create_task(self._morning_sector_task())
         await self._refresh_portfolio()
         self.log(f"Strategy Agent starting | portfolio=${self._portfolio_value:,.2f}")
 
@@ -96,6 +102,47 @@ class StrategyAgent(BaseBot):
         if len(self._options_signals) > 30:
             self._options_signals = self._options_signals[-30:]
 
+    # ── Morning sector strength check ─────────────────────────────────────────
+
+    async def _morning_sector_task(self):
+        """At 9:00am EST, check sector ETFs and set the day's strongest sector."""
+        while self.running:
+            now_et = datetime.now(MARKET_TZ)
+            target = now_et.replace(hour=9, minute=0, second=0, microsecond=0)
+            if now_et >= target:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now_et).total_seconds())
+            if datetime.now(MARKET_TZ).weekday() >= 5:
+                continue
+            await self._check_sector_strength()
+
+    async def _check_sector_strength(self):
+        """Fetch sector ETF bars, find the strongest, store symbols to prioritize."""
+        etfs = list(UniverseConfig.SECTOR_ETFS.keys())
+        start = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+        try:
+            from alpaca.data.timeframe import TimeFrame
+            loop = asyncio.get_event_loop()
+            bars = await loop.run_in_executor(
+                None, lambda: self.alpaca.get_bars(etfs, TimeFrame.Day, start)
+            )
+            best_etf, best_change = "", -999.0
+            for etf, bar_list in bars.items():
+                if len(bar_list) < 2:
+                    continue
+                pct = (bar_list[-1]["close"] - bar_list[-2]["close"]) / bar_list[-2]["close"] * 100
+                if pct > best_change:
+                    best_change, best_etf = pct, etf
+            if best_etf:
+                self._strongest_sector = best_etf
+                self._sector_symbols   = UniverseConfig.SECTOR_ETFS.get(best_etf, [])
+                self.log(
+                    f"Sector strength: {best_etf} leading (+{best_change:.2f}%) | "
+                    f"priority symbols: {self._sector_symbols}"
+                )
+        except Exception as e:
+            self.log(f"Sector check error: {e}", "warning")
+
     # ── Portfolio refresh ──────────────────────────────────────────────────────
 
     async def _refresh_portfolio(self):
@@ -119,7 +166,7 @@ class StrategyAgent(BaseBot):
           position_usd = min(shares * entry, max_position)
         """
         pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-        max_position_usd = min(pv * 0.25, RiskConfig.MAX_SINGLE_POSITION_USD)  # 25% of portfolio, cap $1,000
+        max_position_usd = min(pv * 0.15, RiskConfig.MAX_SINGLE_POSITION_USD)  # 15% of portfolio, cap $1,000
         max_risk_usd     = pv * 0.01    # 1% of real portfolio
 
         # Coerce None → 0 so comparisons never raise TypeError
@@ -203,7 +250,7 @@ class StrategyAgent(BaseBot):
 
         # Use real portfolio value — refreshed from Alpaca before this cycle
         PORTFOLIO    = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-        MAX_POSITION = min(round(PORTFOLIO * 0.25, 2), RiskConfig.MAX_SINGLE_POSITION_USD)
+        MAX_POSITION = min(round(PORTFOLIO * 0.15, 2), RiskConfig.MAX_SINGLE_POSITION_USD)
         MAX_RISK     = round(PORTFOLIO * 0.01, 2)   # 1% of real portfolio
 
         prompt = (
@@ -216,7 +263,15 @@ class StrategyAgent(BaseBot):
             f"  • Stop loss: {RiskConfig.STOP_LOSS_PCT*100:.0f}% from entry\n"
             f"  • Take profit: {RiskConfig.TAKE_PROFIT_PCT*100:.0f}% from entry  (2:1 reward/risk)\n"
             f"  • Max open positions: {RiskConfig.MAX_OPEN_POSITIONS}\n"
-            f"  • Max trades per day: {RiskConfig.MAX_DAILY_TRADES}\n\n"
+            f"  • Max trades per day: {RiskConfig.MAX_DAILY_TRADES}\n"
+            f"  • Confidence threshold: {RiskConfig.CONFIDENCE_THRESHOLD}\n"
+            + (
+                f"\nSECTOR PRIORITY: Today's strongest sector is {self._strongest_sector}. "
+                f"Prefer setups in: {self._sector_symbols}. "
+                "Still include other high-conviction setups if signals are very strong.\n"
+                if self._strongest_sector else ""
+            )
+            + "\n"
             "SIGNALS:\n"
             f"{json.dumps(signals, indent=2)}\n\n"
             "Generate up to 3 high-conviction trade setups. Each setup must include:\n"
@@ -319,7 +374,7 @@ class StrategyAgent(BaseBot):
             self.log(f"No setups generated | market_bias={market_bias}")
         else:
             pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-            max_pos_cap = min(pv * 0.25, RiskConfig.MAX_SINGLE_POSITION_USD)
+            max_pos_cap = min(pv * 0.15, RiskConfig.MAX_SINGLE_POSITION_USD)
             for setup in setups:
                 # Final hard cap — catches any edge case before hitting the wire
                 setup["position_size_usd"] = min(

@@ -12,13 +12,16 @@ Role   : Listens to market data from Bot 4 and runs a multi-timeframe
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import anthropic
+import pytz
 
 from config import Models, RedisConfig, UniverseConfig, AnthropicConfig
 from shared.base_bot import BaseBot
+
+MARKET_TZ = pytz.timezone("America/New_York")
 
 
 SCAN_INTERVAL  = UniverseConfig.SCAN_INTERVAL_SECONDS
@@ -39,12 +42,16 @@ class MomentumScanner(BaseBot):
         self.client = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
         # Latest data packet per symbol (written by _on_market_data)
         self._latest: dict[str, dict] = {}
+        # Daily watchlist — set at 9am, watched all day, updated next morning
+        self._daily_watchlist: set[str] = set()
+        self._watchlist_set: bool = False   # True once 9am task has run today
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def setup(self):
         await self.bus.subscribe(RedisConfig.CHANNEL_MARKET_DATA, self._on_market_data)
         asyncio.create_task(self.bus.listen())
+        asyncio.create_task(self._morning_watchlist_task())
         self.log("Momentum Scanner starting")
 
     async def run(self):
@@ -58,6 +65,59 @@ class MomentumScanner(BaseBot):
 
     async def cleanup(self):
         self.log("Momentum Scanner stopped")
+
+    # ── Morning watchlist (9am, once per day) ─────────────────────────────────
+
+    async def _morning_watchlist_task(self):
+        """At 9am, read bot04's morning scan and lock in the top 20 watchlist for the day."""
+        while self.running:
+            now_et = datetime.now(MARKET_TZ)
+            target = now_et.replace(hour=9, minute=0, second=0, microsecond=0)
+            if now_et >= target:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now_et).total_seconds())
+            if datetime.now(MARKET_TZ).weekday() >= 5:
+                continue
+            self._watchlist_set = False
+            await self._build_daily_watchlist()
+
+    async def _build_daily_watchlist(self):
+        """
+        Read the morning scan results from bot04 (or fall back to scoring
+        all available market data). Set self._daily_watchlist to top 20 symbols.
+        """
+        # Try to get bot04's morning scan picks first
+        try:
+            scan = await self.bus.get_state("bot4:morning_scan") or {}
+            opps = scan.get("opportunities", [])
+            if opps:
+                top_syms = [o["symbol"] for o in opps[:20] if o.get("symbol")]
+                self._daily_watchlist = set(top_syms)
+                self._watchlist_set   = True
+                self.log(
+                    f"Daily watchlist set from morning scan: {sorted(self._daily_watchlist)}"
+                )
+                return
+        except Exception as e:
+            self.log(f"Morning scan read error: {e}", "warning")
+
+        # Fallback: score whatever market data we already have, take top 20
+        if self._latest:
+            scored = []
+            for sym, data in self._latest.items():
+                result = self._score_symbol(data)
+                scored.append((sym, result["score"]))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            self._daily_watchlist = {s[0] for s in scored[:20]}
+            self._watchlist_set   = True
+            self.log(
+                f"Daily watchlist set from live scores (fallback): "
+                f"{sorted(self._daily_watchlist)}"
+            )
+        else:
+            # No data yet — use full watchlist as default
+            self._daily_watchlist = set(UniverseConfig.WATCHLIST)
+            self.log("Daily watchlist defaulted to WATCHLIST (no scan data yet)")
 
     # ── Market data ingestion ──────────────────────────────────────────────────
 
@@ -255,8 +315,16 @@ class MomentumScanner(BaseBot):
             self.log("No market data yet, skipping scan")
             return
 
+        # Only score symbols on the daily watchlist (set at 9am)
+        # Fall back to full universe if watchlist not yet populated
+        scan_universe = (
+            {sym: data for sym, data in self._latest.items()
+             if sym in self._daily_watchlist}
+            if self._daily_watchlist else self._latest
+        )
+
         scored = []
-        for sym, data in self._latest.items():
+        for sym, data in scan_universe.items():
             result = self._score_symbol(data)
             if result["score"] >= MIN_SCORE or result["score"] <= (1 - MIN_SCORE):
                 ind = data.get("indicators", {})
@@ -312,9 +380,8 @@ class MomentumScanner(BaseBot):
         }
         await self.save_state("leaderboard", leaderboard, ttl=120)
         self.log(
-            f"Scan complete | {len(self._latest)} symbols | "
-            f"{len(bullish)} bullish | {len(bearish)} bearish | "
-            f"published {published}"
+            f"Scan complete | watchlist={len(scan_universe)}/{len(self._latest)} symbols | "
+            f"{len(bullish)} bullish | {len(bearish)} bearish | published {published}"
         )
 
 

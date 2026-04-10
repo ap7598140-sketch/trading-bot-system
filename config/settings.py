@@ -58,9 +58,10 @@ class RiskConfig:
     MAX_POSITION_SIZE       = float(os.getenv("MAX_POSITION_SIZE", "10000"))
     MAX_PORTFOLIO_RISK      = float(os.getenv("MAX_PORTFOLIO_RISK", "0.025"))
     MAX_DAILY_LOSS          = 0.05    # 5% daily loss limit
-    MAX_OPEN_POSITIONS      = 8       # max simultaneous open positions
-    MAX_DAILY_TRADES        = 10      # max orders submitted per day
+    MAX_OPEN_POSITIONS      = 10      # max simultaneous open positions
+    MAX_DAILY_TRADES        = 20      # max orders submitted per day
     MAX_SINGLE_POSITION_USD = 1000.0  # hard $1,000 cap per individual trade
+    CONFIDENCE_THRESHOLD    = 0.55    # minimum confidence to approve a trade
     STOP_LOSS_PCT           = 0.01    # 1% stop loss
     TAKE_PROFIT_PCT         = 0.02    # 2% take profit  →  2:1 reward/risk
     MAX_SECTOR_EXPOSURE     = 0.30    # 30% in any one sector
@@ -68,11 +69,51 @@ class RiskConfig:
 
 # ── Trading universe ───────────────────────────────────────────────────────────
 class UniverseConfig:
+    # Core watchlist (continuously monitored)
     WATCHLIST = [
         "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
         "META", "TSLA", "SPY",  "QQQ",  "AMD",
-        "NFLX", "AAPL", "JPM",  "BAC",  "GS",
+        "NFLX", "JPM",  "BAC",  "GS",   "COIN",
     ]
+
+    # Expanded universe for the 9am morning scan (top volume/gap candidates)
+    SCAN_UNIVERSE = [
+        # Mega-cap tech
+        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO",
+        # Semiconductors
+        "AMD", "INTC", "MU", "QCOM", "ARM", "SMCI",
+        # Software / Cloud
+        "CRM", "ORCL", "ADBE", "NOW", "SNOW", "PLTR", "PANW",
+        # Finance
+        "JPM", "BAC", "GS", "MS", "WFC", "V", "MA", "SCHW", "COIN",
+        # Energy
+        "XOM", "CVX", "COP", "OXY",
+        # Healthcare / Pharma / Biotech
+        "LLY", "UNH", "PFE", "ABBV", "MRK", "AMGN", "MRNA", "BIIB",
+        # Consumer
+        "COST", "WMT", "TGT", "NKE", "SBUX", "MCD",
+        # Streaming / Media
+        "NFLX", "DIS", "SPOT",
+        # EV / Autos
+        "F", "GM", "RIVN",
+        # Crypto-linked
+        "HOOD", "MSTR",
+        # Sector ETFs (for sector-strength check)
+        "XLK", "XLF", "XLE", "XLV", "XLI", "XLY",
+        # Broad market ETFs
+        "SPY", "QQQ", "IWM",
+    ]
+
+    # Sector ETF → member symbols mapping (for sector filter in bot05)
+    SECTOR_ETFS = {
+        "XLK": ["AAPL", "MSFT", "NVDA", "AVGO", "AMD", "CRM", "ADBE", "ORCL", "NOW", "QCOM"],
+        "XLF": ["JPM", "BAC", "GS", "MS", "WFC", "V", "MA", "SCHW", "COIN"],
+        "XLE": ["XOM", "CVX", "COP", "OXY", "SLB"],
+        "XLV": ["LLY", "UNH", "PFE", "ABBV", "MRK", "AMGN", "MRNA"],
+        "XLI": ["GE", "HON", "CAT", "DE", "UPS", "FDX"],
+        "XLY": ["AMZN", "TSLA", "HD", "NKE", "SBUX", "MCD", "COST"],
+    }
+
     SCAN_INTERVAL_SECONDS = 600  # how often momentum scanner runs (10 min)
     DATA_REFRESH_SECONDS  = 300  # how often data agent refreshes (5 min)
 

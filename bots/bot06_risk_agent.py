@@ -51,6 +51,8 @@ class RiskAgent(BaseBot):
         self._rejected_today: int       = 0
         self._approved_today: int       = 0
         self._pre_market_logged: set    = set()  # symbols already logged during pre-market
+        # Trailing stop tracking: symbol → {entry, highest_price, trail_stop}
+        self._trailing_stops: dict[str, dict] = {}
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -181,7 +183,7 @@ class RiskAgent(BaseBot):
         # Always recalculate position size — never trust incoming value
         # (Strategy Agent may send AI-generated sizes that exceed limits)
         pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-        max_position = min(pv * 0.25, RiskConfig.MAX_SINGLE_POSITION_USD)  # 25% of portfolio, hard $1,000 cap
+        max_position = min(pv * 0.15, RiskConfig.MAX_SINGLE_POSITION_USD)  # 15% of portfolio, hard $1,000 cap
         max_risk     = pv * 0.01    # 1% of real portfolio
         if entry > 0 and sl > 0:
             stop_distance = abs(entry - sl)
@@ -246,8 +248,10 @@ class RiskAgent(BaseBot):
                 reasons.append(f"Risk/reward {rr:.2f} below minimum 1.5")
 
         # 8. Confidence threshold
-        if setup.get("confidence", 0) < 0.45:
-            reasons.append(f"Confidence {setup.get('confidence'):.2f} below threshold 0.45")
+        if setup.get("confidence", 0) < RiskConfig.CONFIDENCE_THRESHOLD:
+            reasons.append(
+                f"Confidence {setup.get('confidence', 0):.2f} below threshold {RiskConfig.CONFIDENCE_THRESHOLD}"
+            )
 
         return len(reasons) == 0, reasons
 
@@ -392,13 +396,59 @@ class RiskAgent(BaseBot):
     async def _monitor_positions(self):
         await self._refresh_portfolio()
 
-        for pos in self._open_positions:
-            sym        = pos["symbol"]
-            entry      = pos["avg_entry"]
-            current    = pos["current_price"]
-            pnl_pct    = (current - entry) / entry if entry > 0 else 0
+        # Remove trailing stop entries for positions no longer open
+        active_syms = {p["symbol"] for p in self._open_positions}
+        for sym in list(self._trailing_stops):
+            if sym not in active_syms:
+                del self._trailing_stops[sym]
 
-            # Stop loss breach
+        for pos in self._open_positions:
+            sym     = pos["symbol"]
+            entry   = pos["avg_entry"]
+            current = pos["current_price"]
+            pnl_pct = (current - entry) / entry if entry > 0 else 0
+
+            # ── Trailing stop logic ──────────────────────────────────────────
+            trail = self._trailing_stops.setdefault(sym, {
+                "entry":         entry,
+                "highest_price": current,
+                "trail_stop":    None,
+            })
+            # Update highest seen price
+            if current > trail["highest_price"]:
+                trail["highest_price"] = current
+            highest_pnl = (trail["highest_price"] - entry) / entry if entry > 0 else 0
+
+            # Move stop as profit grows
+            if highest_pnl >= 0.02:          # up 2%+: lock in 1% profit
+                trail["trail_stop"] = round(entry * 1.01, 4)
+            elif highest_pnl >= 0.01:        # up 1%+: move to breakeven
+                trail["trail_stop"] = round(entry, 4)
+
+            # Fire trailing stop if price drops back through it
+            if trail["trail_stop"] is not None and current < trail["trail_stop"]:
+                reason = (
+                    f"Trailing stop: price ${current:.2f} fell below "
+                    f"${trail['trail_stop']:.2f} (locked from ${trail['highest_price']:.2f} high)"
+                )
+                await self.publish(RedisConfig.CHANNEL_ORDERS, {
+                    "type":     "force_close",
+                    "symbol":   sym,
+                    "reason":   reason,
+                    "priority": "immediate",
+                })
+                await self.publish(RedisConfig.CHANNEL_ALERTS, {
+                    "type":    "stop_loss_triggered",
+                    "symbol":  sym,
+                    "pnl_pct": round(pnl_pct * 100, 2),
+                    "entry":   entry,
+                    "current": current,
+                    "trail":   True,
+                })
+                self.log(f"TRAILING STOP: {sym} | {reason}", "warning")
+                continue   # skip regular sl/tp check for this bar
+
+            # ── Regular stop loss ────────────────────────────────────────────
             if pnl_pct <= -RiskConfig.STOP_LOSS_PCT:
                 await self.publish(RedisConfig.CHANNEL_ORDERS, {
                     "type":      "force_close",
@@ -415,7 +465,7 @@ class RiskAgent(BaseBot):
                 })
                 self.log(f"STOP LOSS: {sym} | pnl={pnl_pct*100:.2f}%", "warning")
 
-            # Take profit breach
+            # ── Take profit ──────────────────────────────────────────────────
             elif pnl_pct >= RiskConfig.TAKE_PROFIT_PCT:
                 await self.publish(RedisConfig.CHANNEL_ORDERS, {
                     "type":    "take_profit",

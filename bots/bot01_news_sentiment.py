@@ -12,6 +12,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 import aiohttp
+import pytz
 
 import anthropic
 
@@ -20,6 +21,7 @@ from shared.base_bot import BaseBot
 
 
 POLL_INTERVAL = 1200  # seconds between news fetches (20 min)
+MARKET_TZ     = pytz.timezone("America/New_York")
 
 
 class NewsSentimentBot(BaseBot):
@@ -37,11 +39,13 @@ class NewsSentimentBot(BaseBot):
         self.client     = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
         self.news_api   = AlertConfig.NEWS_API_KEY
         self._seen_ids: set[str] = set()   # dedup headline IDs
+        self._catalyst_scan_done: bool = False  # runs once at 9am per day
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def setup(self):
         self.log(f"News Sentiment Bot starting | symbols={len(UniverseConfig.WATCHLIST)}")
+        asyncio.create_task(self._morning_catalyst_task())
 
     async def run(self):
         while self.running:
@@ -54,9 +58,113 @@ class NewsSentimentBot(BaseBot):
     async def cleanup(self):
         self.log("News Sentiment Bot stopped")
 
+    # ── 9am Catalyst scan (runs ONCE per day) ─────────────────────────────────
+
+    async def _morning_catalyst_task(self):
+        """At 9:00am EST, run a targeted catalyst scan and flag HIGH-priority trades."""
+        while self.running:
+            now_et = datetime.now(MARKET_TZ)
+            target = now_et.replace(hour=9, minute=0, second=0, microsecond=0)
+            if now_et >= target:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now_et).total_seconds())
+            if datetime.now(MARKET_TZ).weekday() >= 5:
+                continue
+            self._catalyst_scan_done = False
+            await self._run_catalyst_scan()
+            self._catalyst_scan_done = True
+
+    async def _run_catalyst_scan(self):
+        """
+        Fetch pre-market news and flag stocks with HIGH-priority catalysts:
+          - Earnings beat / miss
+          - Analyst upgrade / downgrade
+          - FDA approval / rejection
+          - Merger / acquisition announcement
+        Publishes each catalyst as a HIGH-priority news_sentiment event.
+        """
+        self.log("9am catalyst scan starting...")
+        symbols = list(dict.fromkeys(
+            UniverseConfig.WATCHLIST + getattr(UniverseConfig, "SCAN_UNIVERSE", [])
+        ))
+
+        # Fetch last 12 hours of news (captures overnight + pre-market)
+        articles = await self._fetch_alpaca_news(symbols, hours=12)
+        if not articles and self.news_api:
+            articles = await self._fetch_newsapi(symbols, hours=12)
+
+        if not articles:
+            self.log("Catalyst scan: no articles found")
+            return
+
+        # Use Claude to identify high-priority catalysts
+        catalysts = await self._identify_catalysts(articles)
+        if not catalysts:
+            self.log("Catalyst scan: no high-priority catalysts found")
+            return
+
+        # Publish each catalyst as HIGH priority
+        for cat in catalysts:
+            await self.publish(RedisConfig.CHANNEL_NEWS, {
+                "type":      "news_sentiment",
+                "sentiment": cat.get("sentiment", "bullish"),
+                "score":     cat.get("score", 0.9),
+                "symbols":   cat.get("symbols", []),
+                "catalyst":  cat.get("catalyst", ""),
+                "title":     cat.get("title", ""),
+                "priority":  "high",
+                "source":    "morning_catalyst_scan",
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            self.log(
+                f"HIGH-priority catalyst: {cat.get('symbols')} | "
+                f"{cat.get('catalyst')} | {cat.get('sentiment')}"
+            )
+
+        self.log(f"Catalyst scan complete | {len(catalysts)} high-priority events")
+
+    async def _identify_catalysts(self, articles: list[dict]) -> list[dict]:
+        """Use Haiku to identify earnings/analyst/FDA/merger events from article list."""
+        items = [
+            {"title": a.get("title", ""), "summary": (a.get("description") or "")[:200]}
+            for a in articles[:50]   # cap to 50 to keep prompt size reasonable
+        ]
+        prompt = (
+            "You are a financial news analyst scanning pre-market news for high-priority catalysts.\n\n"
+            "Identify articles about:\n"
+            "  - Earnings beats or misses (EPS surprise)\n"
+            "  - Analyst upgrades or downgrades (rating changes, price target changes)\n"
+            "  - FDA approvals, rejections, or clinical trial results\n"
+            "  - Merger, acquisition, or buyout announcements\n\n"
+            f"Articles:\n{json.dumps(items)}\n\n"
+            "For each high-priority event found, extract:\n"
+            "  symbols (list of tickers affected), catalyst (type: earnings_beat/earnings_miss/"
+            "analyst_upgrade/analyst_downgrade/fda_approval/fda_rejection/merger), "
+            "sentiment (bullish/bearish), score (0.7-1.0), title (the headline)\n\n"
+            "ONLY include events with clear catalyst types listed above. Ignore general news.\n"
+            "Respond ONLY with JSON:\n"
+            "{\"catalysts\": [{\"symbols\": [\"AAPL\"], \"catalyst\": \"earnings_beat\", "
+            "\"sentiment\": \"bullish\", \"score\": 0.92, \"title\": \"...\"}]}"
+        )
+        try:
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.client.messages.create(
+                    model=self.model,
+                    max_tokens=2000,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+            )
+            raw    = self._extract_json_block(response.content[0].text.strip())
+            parsed = json.loads(raw)
+            return parsed.get("catalysts", [])
+        except Exception as e:
+            self.log(f"Catalyst identification error: {e}", "warning")
+            return []
+
     # ── News fetch ─────────────────────────────────────────────────────────────
 
-    async def _fetch_newsapi(self, symbols: list[str]) -> list[dict]:
+    async def _fetch_newsapi(self, symbols: list[str], hours: int = 4) -> list[dict]:
         """Fetch headlines from NewsAPI.org."""
         if not self.news_api:
             return []
@@ -80,7 +188,7 @@ class NewsSentimentBot(BaseBot):
                 data = await resp.json()
                 return data.get("articles", [])
 
-    async def _fetch_alpaca_news(self, symbols: list[str]) -> list[dict]:
+    async def _fetch_alpaca_news(self, symbols: list[str], hours: int = 4) -> list[dict]:
         """Fetch news from Alpaca's news endpoint (no API key beyond trading key)."""
         from config import AlpacaConfig
         url = "https://data.alpaca.markets/v1beta1/news"
@@ -242,9 +350,9 @@ class NewsSentimentBot(BaseBot):
         symbols = list(dict.fromkeys(UniverseConfig.WATCHLIST))
 
         # Try Alpaca news first (no extra key needed), fallback to NewsAPI
-        articles = await self._fetch_alpaca_news(symbols)
+        articles = await self._fetch_alpaca_news(symbols, hours=4)
         if not articles and self.news_api:
-            articles = await self._fetch_newsapi(symbols)
+            articles = await self._fetch_newsapi(symbols, hours=4)
 
         # Deduplicate
         new_articles = []
