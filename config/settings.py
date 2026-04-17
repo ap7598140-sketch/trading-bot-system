@@ -129,11 +129,17 @@ class CircuitBreakerConfig:
 
 # ── HMM Regime Detection ──────────────────────────────────────────────────────
 class RegimeConfig:
-    TRAIN_DAYS      = 504   # ~2 years of daily bars for HMM training
-    STABILITY_BARS  = 3     # consecutive bars required before regime acts
-    FLICKER_WINDOW  = 20    # look-back bars for flicker detection
-    FLICKER_THRESH  = 4     # changes in FLICKER_WINDOW → uncertain
-    RETRAIN_HOURS   = 24    # retrain every 24 h (nightly)
+    TRAIN_DAYS              = 504   # ~2 years of daily bars for HMM training
+    REGIME_LOOKBACK_DAYS    = 504   # alias used by regime_detector
+    REGIME_MIN_STATES       = 3
+    REGIME_MAX_STATES       = 7
+    STABILITY_BARS          = 3     # consecutive bars required before regime acts
+    REGIME_STABILITY_BARS   = 3     # alias
+    FLICKER_WINDOW          = 20    # look-back bars for flicker detection
+    REGIME_FLICKER_WINDOW   = 20    # alias
+    FLICKER_THRESH          = 4     # changes in FLICKER_WINDOW → uncertain
+    REGIME_FLICKER_THRESHOLD = 4    # alias
+    RETRAIN_HOURS           = 24    # retrain every 24 h (nightly)
     # Allocation scales per regime (multiplied against position sizing)
     ALLOC_EUPHORIA  = 0.70
     ALLOC_BULL      = 0.95
