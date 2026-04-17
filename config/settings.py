@@ -118,6 +118,31 @@ class UniverseConfig:
     DATA_REFRESH_SECONDS  = 300  # how often data agent refreshes (5 min)
 
 
+# ── Circuit Breaker thresholds ────────────────────────────────────────────────
+class CircuitBreakerConfig:
+    DAILY_HALVE_PCT    = 0.02   # down 2% today   → halve position sizes
+    DAILY_CLOSE_PCT    = 0.03   # down 3% today   → close all positions
+    WEEKLY_QUARTER_PCT = 0.05   # down 5% week    → quarter position sizes
+    PEAK_LOCKOUT_PCT   = 0.10   # down 10% peak   → write LOCKFILE.lock
+    PEAK_EMERGENCY_PCT = 0.15   # down 15% peak   → emergency exit + alert
+
+
+# ── HMM Regime Detection ──────────────────────────────────────────────────────
+class RegimeConfig:
+    TRAIN_DAYS      = 504   # ~2 years of daily bars for HMM training
+    STABILITY_BARS  = 3     # consecutive bars required before regime acts
+    FLICKER_WINDOW  = 20    # look-back bars for flicker detection
+    FLICKER_THRESH  = 4     # changes in FLICKER_WINDOW → uncertain
+    RETRAIN_HOURS   = 24    # retrain every 24 h (nightly)
+    # Allocation scales per regime (multiplied against position sizing)
+    ALLOC_EUPHORIA  = 0.70
+    ALLOC_BULL      = 0.95
+    ALLOC_NEUTRAL   = 0.60
+    ALLOC_BEAR      = 0.25
+    ALLOC_CRASH     = 0.00
+    ALLOC_UNCERTAIN = 0.50  # multiplier applied on top of regime scale when flickering
+
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR   = os.path.join(BASE_DIR, "logs")

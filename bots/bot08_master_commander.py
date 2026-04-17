@@ -20,9 +20,11 @@ import pytz
 import anthropic
 import httpx
 
-from config import Models, RedisConfig, AnthropicConfig, RiskConfig, AlertConfig
+from config import Models, RedisConfig, AnthropicConfig, RiskConfig, AlertConfig, RegimeConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
+from shared.circuit_breaker import CircuitBreaker, CBState
+from shared.regime_detector import RegimeDetector
 
 
 COMMAND_INTERVAL  = 300   # seconds between commander reviews (5 min)
@@ -89,6 +91,14 @@ class MasterCommander(BaseBot):
         self._momentum_board:  dict = {}
         self._news_summary:    dict = {}
 
+        # Circuit breaker and regime detection
+        self._cb              = CircuitBreaker()
+        self._regime          = RegimeDetector()
+        self._cb_state:       CBState | None = None
+        self._current_regime: str  = "neutral"
+        self._regime_scale:   float = 1.0
+        self._regime_trained: bool  = False
+
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def setup(self):
@@ -97,8 +107,10 @@ class MasterCommander(BaseBot):
         await self.bus.subscribe(RedisConfig.CHANNEL_ALERTS,    self._on_alert)
         asyncio.create_task(self.bus.listen())
         asyncio.create_task(self._eod_close_task())
+        asyncio.create_task(self._regime_train_task())
         await self._refresh_portfolio()
         self._session_start_val = self._portfolio_value
+        self._cb.set_week_start(self._portfolio_value)
         self.log(
             f"Master Commander online | portfolio=${self._portfolio_value:,.2f} | "
             f"paper={True}"
@@ -164,6 +176,81 @@ class MasterCommander(BaseBot):
         elif alert_type == "take_profit":
             self._wins_today += 1
             self._consecutive_losses = 0  # reset streak on a winner
+
+    # ── Regime detection ──────────────────────────────────────────────────────
+
+    async def _regime_train_task(self):
+        """Train HMM regime detector once at startup, then every 24 h."""
+        while self.running:
+            await self._train_regime()
+            await asyncio.sleep(RegimeConfig.RETRAIN_HOURS * 3600)
+
+    async def _train_regime(self):
+        """Fetch 2 years of SPY daily bars and train the HMM."""
+        try:
+            from alpaca.data.timeframe import TimeFrame
+            from datetime import timezone
+            start = (datetime.now(timezone.utc) - timedelta(days=RegimeConfig.TRAIN_DAYS + 5)
+                     ).strftime("%Y-%m-%d")
+            loop  = asyncio.get_event_loop()
+            bars  = await loop.run_in_executor(
+                None, lambda: self.alpaca.get_bars(["SPY"], TimeFrame.Day, start)
+            )
+            spy_bars = bars.get("SPY", [])
+            if len(spy_bars) < 60:
+                self.log("Regime training: insufficient SPY bars", "warning")
+                return
+            import numpy as np
+            closes  = np.array([b["close"]  for b in spy_bars], dtype=float)
+            volumes = np.array([b["volume"] for b in spy_bars], dtype=float)
+            ok = await loop.run_in_executor(
+                None, lambda: self._regime.train(closes, volumes)
+            )
+            if ok:
+                self._regime_trained = True
+                self.log("Regime detector trained successfully")
+            else:
+                self.log("Regime training failed (hmmlearn unavailable?)", "warning")
+        except Exception as e:
+            self.log(f"Regime training error: {e}", "warning")
+
+    async def _update_regime(self):
+        """Predict current regime from recent SPY bars and cache to Redis."""
+        if not self._regime_trained:
+            return
+        try:
+            from alpaca.data.timeframe import TimeFrame
+            from datetime import timezone
+            start = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+            loop  = asyncio.get_event_loop()
+            bars  = await loop.run_in_executor(
+                None, lambda: self.alpaca.get_bars(["SPY"], TimeFrame.Day, start)
+            )
+            spy_bars = bars.get("SPY", [])
+            if len(spy_bars) < 6:
+                return
+            import numpy as np
+            closes  = np.array([b["close"]  for b in spy_bars], dtype=float)
+            volumes = np.array([b["volume"] for b in spy_bars], dtype=float)
+            regime = await loop.run_in_executor(
+                None, lambda: self._regime.predict(closes, volumes)
+            )
+            self._current_regime = regime
+            self._regime_scale   = self._regime.allocation_scale()
+            uncertain            = self._regime.is_uncertain()
+            # Publish for bot05 and dashboard
+            await self.save_state("regime", {
+                "regime":    regime,
+                "scale":     self._regime_scale,
+                "uncertain": uncertain,
+                "timestamp": datetime.utcnow().isoformat(),
+            }, ttl=600)
+            self.log(
+                f"Regime: {regime} | scale={self._regime_scale:.2f} | "
+                f"uncertain={uncertain}"
+            )
+        except Exception as e:
+            self.log(f"Regime update error: {e}", "warning")
 
     # ── Portfolio ──────────────────────────────────────────────────────────────
 
@@ -479,6 +566,46 @@ class MasterCommander(BaseBot):
         self._total_commands += 1
         await self._refresh_portfolio()
 
+        # ── Circuit breaker VETO check (highest priority) ──────────────────────
+        if CircuitBreaker.is_locked():
+            self.log("LOCKFILE.lock exists — trading locked out. Delete file to resume.", "critical")
+            if not self._system_halted:
+                await self._emergency_halt("LOCKFILE.lock present — manual intervention required")
+        else:
+            cb = self._cb.check(self._portfolio_value, self._session_start_val)
+            self._cb_state = cb
+            if cb.level > 0:
+                self.log(f"Circuit breaker L{cb.level}: {cb.action} — {cb.reason}", "warning")
+            if cb.action == "emergency_exit" and not self._system_halted:
+                await self._emergency_halt(cb.reason)
+                loop = asyncio.get_event_loop()
+                try:
+                    await loop.run_in_executor(None, self.alpaca.close_all_positions)
+                except Exception as e:
+                    self.log(f"CB emergency close error: {e}", "error")
+                await self._send_telegram(f"🚨 CIRCUIT BREAKER EMERGENCY\n{cb.reason}")
+            elif cb.action in ("lockout",) and not self._system_halted:
+                await self._emergency_halt(cb.reason)
+            elif cb.action == "close_all" and not self._system_halted:
+                loop = asyncio.get_event_loop()
+                try:
+                    await loop.run_in_executor(None, self.alpaca.close_all_positions)
+                    self.log("Circuit breaker: all positions closed")
+                except Exception as e:
+                    self.log(f"CB close_all error: {e}", "error")
+            # Publish CB scale so bot05 can adjust position sizing
+            await self.save_state("cb_state", {
+                "level":          cb.level,
+                "action":         cb.action,
+                "reason":         cb.reason,
+                "position_scale": cb.position_scale,
+                "trading_allowed": cb.trading_allowed,
+                "timestamp":      datetime.utcnow().isoformat(),
+            }, ttl=120)
+
+        # ── Update regime ──────────────────────────────────────────────────────
+        await self._update_regime()
+
         # Market session
         session = self._get_market_session()
         if session != self._market_session:
@@ -522,6 +649,7 @@ class MasterCommander(BaseBot):
             self.log(f"State load error: {e}", "warning")
 
         # Build system state snapshot
+        cb = self._cb_state
         system_state = {
             "timestamp":       datetime.utcnow().isoformat(),
             "market_session":  self._market_session,
@@ -536,6 +664,18 @@ class MasterCommander(BaseBot):
             "strategy":        self._strategy_state,
             "momentum":        self._momentum_board,
             "news":            self._news_summary,
+            "circuit_breaker": {
+                "level":          cb.level if cb else 0,
+                "action":         cb.action if cb else "continue",
+                "position_scale": cb.position_scale if cb else 1.0,
+                "reason":         cb.reason if cb else "",
+            },
+            "regime": {
+                "name":           self._current_regime,
+                "scale":          self._regime_scale,
+                "uncertain":      self._regime.is_uncertain(),
+                "trained":        self._regime_trained,
+            },
         }
 
         # ── Hard-coded halt rules (never based on data feed availability) ──────
@@ -587,10 +727,12 @@ class MasterCommander(BaseBot):
         # Save dashboard state (for external monitoring)
         await self.save_state("dashboard", system_state, ttl=60)
 
+        cb_lvl = self._cb_state.level if self._cb_state else 0
         self.log(
             f"Cycle #{self._total_commands} | session={self._market_session} | "
             f"portfolio=${self._portfolio_value:,.2f} | pnl=${self._daily_pnl:+,.2f} | "
-            f"halted={self._system_halted} | dead_bots={len(dead_bots)}"
+            f"halted={self._system_halted} | dead_bots={len(dead_bots)} | "
+            f"cb=L{cb_lvl} | regime={self._current_regime}(x{self._regime_scale:.2f})"
         )
 
 

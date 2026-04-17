@@ -26,6 +26,8 @@ from alpaca.data.timeframe import TimeFrame
 from config import Models, RedisConfig, AnthropicConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
+from shared.walk_forward import WalkForwardEngine
+from shared.regime_detector import RegimeDetector
 
 
 # Simulation parameters
@@ -47,6 +49,8 @@ class BacktestingBot(BaseBot):
         self.client = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
         self.alpaca = AlpacaClient()
         self._results_history: list[dict] = []
+        self._regime   = RegimeDetector()
+        self._wf_engine = WalkForwardEngine(regime_detector=self._regime)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -94,20 +98,79 @@ class BacktestingBot(BaseBot):
     # ── Nightly run ────────────────────────────────────────────────────────────
 
     async def _nightly_backtest_run(self):
-        self.log("Starting nightly backtest run")
-
-        # Load strategies from Strategy Builder state
-        strategies_raw = await self.bus.get_state("bot11:strategies")
-        if not strategies_raw:
-            self.log("No strategies from Bot 11, using default")
-            strategies_raw = [self._default_strategy()]
+        self.log("Starting nightly backtest run (walk-forward + standard)")
 
         from config import UniverseConfig
-        symbols = UniverseConfig.WATCHLIST[:8]
+        symbols_wf = UniverseConfig.WATCHLIST[:5]   # walk-forward on top 5
+
+        # Train regime detector on SPY before walk-forward
+        await self._train_regime_for_wf(symbols_wf)
+
+        # Walk-forward run
+        await self._run_walk_forward(symbols_wf)
+
+        # Standard per-strategy backtests (existing behaviour)
+        strategies_raw = await self.bus.get_state("bot11:strategies")
+        if not strategies_raw:
+            strategies_raw = [self._default_strategy()]
 
         for strategy in strategies_raw:
-            await self._run_backtest(strategy, symbols, days=90)
-            await asyncio.sleep(5)   # Brief pause between strategies
+            await self._run_backtest(strategy, UniverseConfig.WATCHLIST[:8], days=90)
+            await asyncio.sleep(5)
+
+    async def _train_regime_for_wf(self, symbols: list[str]):
+        """Train HMM on SPY before walk-forward to enable regime breakdown."""
+        try:
+            start = (datetime.now(timezone.utc) - timedelta(days=510)).strftime("%Y-%m-%d")
+            loop  = asyncio.get_event_loop()
+            bars  = await loop.run_in_executor(
+                None, lambda: self.alpaca.get_bars(["SPY"], TimeFrame.Day, start)
+            )
+            spy_bars = bars.get("SPY", [])
+            if len(spy_bars) < 60:
+                return
+            closes  = np.array([b["close"]  for b in spy_bars], dtype=float)
+            volumes = np.array([b["volume"] for b in spy_bars], dtype=float)
+            ok = await loop.run_in_executor(
+                None, lambda: self._regime.train(closes, volumes)
+            )
+            if ok:
+                self.log("Walk-forward: regime detector trained")
+        except Exception as e:
+            self.log(f"Walk-forward regime training error: {e}", "warning")
+
+    async def _run_walk_forward(self, symbols: list[str]):
+        """Run walk-forward engine on each symbol and publish results."""
+        strategy = self._default_strategy()
+        self.log(f"Walk-forward backtest | symbols={symbols}")
+
+        for sym in symbols:
+            try:
+                all_dfs = await self._fetch_historical_data([sym], days=550)
+                df = all_dfs.get(sym)
+                if df is None or len(df) < 420:
+                    self.log(f"  {sym}: insufficient data for walk-forward ({len(df) if df is not None else 0} bars)")
+                    continue
+                df = self._add_indicators(df)
+
+                def strategy_fn(train_df: pd.DataFrame, oos_df: pd.DataFrame) -> list[dict]:
+                    result = self._simulate_strategy(oos_df, strategy)
+                    return result.get("trades", [])
+
+                wf_result = self._wf_engine.run(df, strategy_fn, symbol=sym)
+                agg   = wf_result.get("aggregate", {})
+                bench = wf_result.get("benchmarks", {})
+                self.log(
+                    f"  {sym} WF: return={agg.get('total_return_pct_mean', 0):.1f}% "
+                    f"sharpe={agg.get('sharpe_ratio_mean', 0):.2f} "
+                    f"vs BaH={bench.get('buy_and_hold_return_pct', 0):.1f}%"
+                )
+                wf_result["type"]      = "walk_forward_result"
+                wf_result["timestamp"] = datetime.utcnow().isoformat()
+                await self.save_state(f"wf_{sym}", wf_result, ttl=86400)
+                await self.publish(RedisConfig.CHANNEL_BACKTEST, wf_result)
+            except Exception as e:
+                self.log(f"  {sym} walk-forward error: {e}", "warning")
 
     def _default_strategy(self) -> dict:
         return {

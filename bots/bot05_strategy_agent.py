@@ -49,6 +49,8 @@ class StrategyAgent(BaseBot):
         self._portfolio_value: float         = 0.0   # refreshed from Alpaca each cycle
         self._strongest_sector: str          = ""    # set at 9am, used all day
         self._sector_symbols: list[str]      = []    # symbols in strongest sector
+        self._regime_scale: float            = 1.0   # from bot08 Redis state
+        self._cb_scale: float                = 1.0   # circuit breaker position scale
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -155,32 +157,60 @@ class StrategyAgent(BaseBot):
         except Exception as e:
             self.log(f"Portfolio refresh error: {e} — keeping ${self._portfolio_value:,.2f}", "warning")
 
+    # ── Regime + Circuit Breaker scale ────────────────────────────────────────
+
+    async def _refresh_scales(self):
+        """Read regime allocation scale and circuit breaker scale from Redis."""
+        try:
+            regime_state = await self.bus.get_state("bot8:regime") or {}
+            self._regime_scale = float(regime_state.get("scale", 1.0))
+            # Crash regime: halt all new trades
+            if regime_state.get("regime") == "crash":
+                self._regime_scale = 0.0
+        except Exception:
+            pass
+        try:
+            cb_state = await self.bus.get_state("bot8:cb_state") or {}
+            cb_scale = float(cb_state.get("position_scale", 1.0))
+            # Circuit breaker VETO: if trading not allowed, zero out
+            if not cb_state.get("trading_allowed", True):
+                cb_scale = 0.0
+            self._cb_scale = cb_scale
+        except Exception:
+            pass
+
     # ── Position sizing ────────────────────────────────────────────────────────
 
     def _safe_position_size(self, entry, stop_loss) -> float:
         """
-        Size based on real Alpaca portfolio value:
-          max_position = 20% of portfolio
-          max_risk     = 1.9% of portfolio (safely under the 2.5% risk gate)
-          shares       = int(max_risk / stop_distance)  ← whole shares only
+        Size based on real Alpaca portfolio value, scaled by regime + circuit breaker.
+          max_position = 15% portfolio × regime_scale × cb_scale, cap $1,000
+          max_risk     = 1% portfolio
+          shares       = int(max_risk / stop_distance)
           position_usd = min(shares * entry, max_position)
         """
         pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-        max_position_usd = min(pv * 0.15, RiskConfig.MAX_SINGLE_POSITION_USD)  # 15% of portfolio, cap $1,000
-        max_risk_usd     = pv * 0.01    # 1% of real portfolio
 
-        # Coerce None → 0 so comparisons never raise TypeError
+        # Combined scale: regime allocation × circuit breaker
+        combined_scale = self._regime_scale * self._cb_scale
+        combined_scale = max(0.0, min(combined_scale, 1.0))  # clamp [0, 1]
+
+        max_position_usd = (
+            min(pv * 0.15, RiskConfig.MAX_SINGLE_POSITION_USD) * combined_scale
+        )
+        max_risk_usd = pv * 0.01
+
         entry     = float(entry or 0)
         stop_loss = float(stop_loss or 0)
 
         if entry <= 0 or stop_loss <= 0:
-            return round(max_risk_usd, 2)
+            return round(max_risk_usd * combined_scale, 2)
 
         stop_distance = abs(entry - stop_loss)
         if stop_distance <= 0:
-            return round(max_risk_usd, 2)
+            return round(max_risk_usd * combined_scale, 2)
 
-        shares       = int(max_risk_usd / stop_distance)   # whole shares, truncated
+        shares       = int(max_risk_usd / stop_distance)
         position_usd = min(shares * entry, max_position_usd)
         return round(position_usd, 2)
 
@@ -271,6 +301,11 @@ class StrategyAgent(BaseBot):
                 "Still include other high-conviction setups if signals are very strong.\n"
                 if self._strongest_sector else ""
             )
+            + (
+                f"\nREGIME: {self._regime_scale:.0%} allocation active "
+                f"(CB scale={self._cb_scale:.0%}). "
+                "Position sizes already adjusted — do not override.\n"
+            )
             + "\n"
             "SIGNALS:\n"
             f"{json.dumps(signals, indent=2)}\n\n"
@@ -360,6 +395,16 @@ class StrategyAgent(BaseBot):
             return
 
         await self._refresh_portfolio()
+        await self._refresh_scales()
+
+        # Circuit breaker: if CB says no trading, skip this cycle
+        if self._cb_scale == 0.0:
+            self.log(
+                f"Trading blocked by circuit breaker (cb_scale=0). Skipping cycle.",
+                "warning",
+            )
+            return
+
         signals = self._aggregate_signals()
 
         # Skip only if ALL signal types are empty (1-signal threshold)
