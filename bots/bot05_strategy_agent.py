@@ -160,11 +160,10 @@ class StrategyAgent(BaseBot):
     # ── Regime + Circuit Breaker scale ────────────────────────────────────────
 
     async def _refresh_scales(self):
-        """Read regime allocation scale and circuit breaker scale from Redis."""
+        """Read regime allocation scale, circuit breaker scale, and market gate from Redis."""
         try:
             regime_state = await self.bus.get_state("bot8:regime") or {}
             self._regime_scale = float(regime_state.get("scale", 1.0))
-            # Crash regime: halt all new trades
             if regime_state.get("regime") == "crash":
                 self._regime_scale = 0.0
         except Exception:
@@ -172,10 +171,16 @@ class StrategyAgent(BaseBot):
         try:
             cb_state = await self.bus.get_state("bot8:cb_state") or {}
             cb_scale = float(cb_state.get("position_scale", 1.0))
-            # Circuit breaker VETO: if trading not allowed, zero out
             if not cb_state.get("trading_allowed", True):
                 cb_scale = 0.0
             self._cb_scale = cb_scale
+        except Exception:
+            pass
+        # Market gate: EOD window or Friday wind-down blocks new trades
+        try:
+            gate = await self.bus.get_state("bot8:market_gate") or {}
+            if not gate.get("allow_new_trades", True):
+                self._cb_scale = 0.0   # zero out so decision_cycle exits early
         except Exception:
             pass
 
@@ -397,12 +402,9 @@ class StrategyAgent(BaseBot):
         await self._refresh_portfolio()
         await self._refresh_scales()
 
-        # Circuit breaker: if CB says no trading, skip this cycle
+        # CB scale or market gate set to 0 → no new trades this cycle
         if self._cb_scale == 0.0:
-            self.log(
-                f"Trading blocked by circuit breaker (cb_scale=0). Skipping cycle.",
-                "warning",
-            )
+            self.log("New trades blocked (circuit breaker or market gate). Skipping cycle.", "warning")
             return
 
         signals = self._aggregate_signals()

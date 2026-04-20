@@ -29,12 +29,21 @@ from shared.regime_detector import RegimeDetector
 
 COMMAND_INTERVAL  = 300   # seconds between commander reviews (5 min)
 HEARTBEAT_TIMEOUT = 90    # seconds before a bot is considered dead
-MARKET_TZ         = pytz.timezone("America/New_York")
+MARKET_TZ         = pytz.timezone("America/New_York")   # hardcoded EST — never trust system TZ
 
+# Market session boundaries (all EST, hardcoded — never query broker for these)
+PRE_MARKET   = dt_time(4,  0)
 MARKET_OPEN  = dt_time(9, 30)
 MARKET_CLOSE = dt_time(16, 0)
-PRE_MARKET   = dt_time(4, 0)
 AFTER_HOURS  = dt_time(20, 0)
+
+# EOD closing sequence (EST, hardcoded)
+EOD_FRI_NO_TRADES = dt_time(14,  0)  # 2:00pm Fri — stop new trades early
+EOD_WARN          = dt_time(15, 30)  # 3:30pm daily — stop new buys + warning telegram
+EOD_CLOSE_START   = dt_time(15, 45)  # 3:45pm — begin closing positions (Fri: primary close)
+EOD_HARD_CLOSE    = dt_time(15, 50)  # 3:50pm — hard close all remaining + cancel orders
+EOD_VERIFY        = dt_time(15, 55)  # 3:55pm — verify zero positions + EOD telegram
+EOD_BACKUP_END    = dt_time(16,  0)  # 4:00pm — backup watcher stops
 
 # Bot registry: id → name
 BOT_REGISTRY = {
@@ -107,6 +116,7 @@ class MasterCommander(BaseBot):
         await self.bus.subscribe(RedisConfig.CHANNEL_ALERTS,    self._on_alert)
         asyncio.create_task(self.bus.listen())
         asyncio.create_task(self._eod_close_task())
+        asyncio.create_task(self._backup_close_task())
         asyncio.create_task(self._regime_train_task())
         await self._refresh_portfolio()
         self._session_start_val = self._portfolio_value
@@ -266,18 +276,28 @@ class MasterCommander(BaseBot):
 
     # ── Market session logic ───────────────────────────────────────────────────
 
+    def _now_et(self) -> datetime:
+        """Current datetime in EST — never trusts system timezone."""
+        return datetime.now(MARKET_TZ)
+
     def _get_market_session(self) -> str:
-        now_et = datetime.now(MARKET_TZ).time()
-        if now_et < PRE_MARKET:
+        now_et   = self._now_et()
+        t        = now_et.time()
+        is_fri   = now_et.weekday() == 4
+
+        if t < PRE_MARKET:
             return "closed"
-        elif PRE_MARKET <= now_et < MARKET_OPEN:
+        if PRE_MARKET <= t < MARKET_OPEN:
             return "pre_market"
-        elif MARKET_OPEN <= now_et < MARKET_CLOSE:
+        if MARKET_OPEN <= t < MARKET_CLOSE:
+            if is_fri and t >= EOD_FRI_NO_TRADES:
+                return "friday_wind_down"   # 2pm–4pm Friday: no new trades
+            if t >= EOD_WARN:
+                return "closing_soon"       # 3:30pm+: no new buys any day
             return "open"
-        elif MARKET_CLOSE <= now_et < AFTER_HOURS:
+        if MARKET_CLOSE <= t < AFTER_HOURS:
             return "after_hours"
-        else:
-            return "closed"
+        return "closed"
 
     def _check_bot_health(self) -> dict[int, str]:
         """Check which bots are alive based on heartbeat recency."""
@@ -422,41 +442,34 @@ class MasterCommander(BaseBot):
         except Exception as e:
             self.log(f"Telegram error: {e}", "warning")
 
-    # ── End-of-day position close ──────────────────────────────────────────────
+    # ── EOD helper methods ─────────────────────────────────────────────────────
 
-    async def _eod_close_task(self):
-        """Close all positions at 3:55pm EST every trading day."""
-        while self.running:
-            now_et = datetime.now(MARKET_TZ)
-            target = now_et.replace(hour=15, minute=55, second=0, microsecond=0)
-            if now_et >= target:
-                target += timedelta(days=1)
-            sleep_secs = (target - now_et).total_seconds()
-            self.log(f"EOD position close scheduled in {sleep_secs / 60:.1f} min")
-            await asyncio.sleep(sleep_secs)
-            # Skip weekends
-            if datetime.now(MARKET_TZ).weekday() >= 5:
-                continue
-            await self._run_eod_close()
+    async def _sleep_until_et(self, hour: int, minute: int, second: int = 0):
+        """Sleep until h:m:s EST today. No-op if already past that time."""
+        now_et = self._now_et()
+        target = now_et.replace(hour=hour, minute=minute, second=second, microsecond=0)
+        secs   = (target - now_et).total_seconds()
+        if secs > 0:
+            await asyncio.sleep(secs)
 
-    async def _run_eod_close(self):
-        """
-        EOD close: fetch ALL positions, close every one, verify none remain,
-        retry any stragglers, then send Telegram summary.
-        """
-        self.log("EOD 3:55pm — starting end-of-day position close")
+    async def _get_positions_safe(self) -> list[dict]:
+        """Fetch current positions; returns [] on error."""
         loop = asyncio.get_event_loop()
-
-        # ── Pass 1: fetch and close every position ─────────────────────────
         try:
-            positions = await loop.run_in_executor(None, self.alpaca.get_positions)
+            return await loop.run_in_executor(None, self.alpaca.get_positions)
         except Exception as e:
-            self.log(f"EOD: failed to fetch positions: {e}", "error")
-            positions = []
+            self.log(f"get_positions error: {e}", "warning")
+            return []
 
-        closed: list[dict] = []
-        total_pnl = 0.0
-
+    async def _close_all_market_positions(self, label: str) -> tuple[list[dict], float]:
+        """
+        Fetch all open positions and close each one individually at market.
+        Returns (closed_list, total_pnl).
+        """
+        positions = await self._get_positions_safe()
+        loop      = asyncio.get_event_loop()
+        closed:    list[dict] = []
+        total_pnl: float      = 0.0
         for pos in positions:
             sym = pos["symbol"]
             pnl = float(pos.get("unrealized_pl", 0.0))
@@ -465,100 +478,243 @@ class MasterCommander(BaseBot):
                 closed.append({"symbol": sym, "pnl": pnl})
                 total_pnl += pnl
                 sign = "+" if pnl >= 0 else ""
-                self.log(f"EOD closed {sym}: {sign}${pnl:.2f}")
+                self.log(f"EOD [{label}] closed {sym}: {sign}${pnl:.2f}")
             except Exception as e:
-                self.log(f"EOD close failed for {sym}: {e}", "warning")
+                self.log(f"EOD [{label}] close failed {sym}: {e}", "warning")
+        return closed, total_pnl
 
-        # ── Wait 5 s then verify ────────────────────────────────────────────
-        await asyncio.sleep(5)
-
+    async def _cancel_all_orders_safe(self):
+        """Cancel all open orders; silent on error."""
+        loop = asyncio.get_event_loop()
         try:
-            remaining = await loop.run_in_executor(None, self.alpaca.get_positions)
+            await loop.run_in_executor(None, self.alpaca.cancel_all_orders)
+            self.log("EOD: all open orders cancelled")
         except Exception as e:
-            self.log(f"EOD: verification fetch failed: {e}", "warning")
-            remaining = []
+            self.log(f"EOD: cancel orders error: {e}", "warning")
 
-        # ── Pass 2: retry any positions still open ──────────────────────────
-        if remaining:
-            self.log(
-                f"EOD: {len(remaining)} position(s) still open after pass 1 — retrying: "
-                f"{[p['symbol'] for p in remaining]}",
-                "warning",
-            )
-            for pos in remaining:
-                sym = pos["symbol"]
-                pnl = float(pos.get("unrealized_pl", 0.0))
-                try:
-                    await loop.run_in_executor(None, lambda s=sym: self.alpaca.close_position(s))
-                    # Update P/L if already recorded (duplicate position), otherwise append
-                    existing = next((c for c in closed if c["symbol"] == sym), None)
-                    if existing:
-                        existing["pnl"] += pnl
-                        total_pnl += pnl
-                    else:
-                        closed.append({"symbol": sym, "pnl": pnl})
-                        total_pnl += pnl
-                    sign = "+" if pnl >= 0 else ""
-                    self.log(f"EOD retry closed {sym}: {sign}${pnl:.2f}")
-                except Exception as e:
-                    self.log(f"EOD retry close failed for {sym}: {e}", "warning")
-
-            # Final verification
-            await asyncio.sleep(3)
-            try:
-                still_open = await loop.run_in_executor(None, self.alpaca.get_positions)
-                if still_open:
-                    syms = [p["symbol"] for p in still_open]
-                    self.log(f"EOD: WARNING — {len(still_open)} position(s) could not be closed: {syms}", "warning")
-                else:
-                    self.log("EOD: all positions confirmed closed after retry")
-            except Exception as e:
-                self.log(f"EOD: final verification failed: {e}", "warning")
-        else:
-            self.log("EOD: all positions confirmed closed")
-
-        # ── Tally EOD closed positions into win/loss counters ───────────────
-        for c in closed:
-            if c["pnl"] > 0:
-                self._wins_today   += 1
-            elif c["pnl"] < 0:
-                self._losses_today += 1
-
-        # ── Reset daily trade counter ───────────────────────────────────────
-        total_trades = self._real_trades_today
-        self._real_trades_today = 0
-        self.log("EOD: daily trade counter reset to 0")
-
-        # ── Refresh portfolio for accurate closing value ────────────────────
-        await self._refresh_portfolio()
-
-        # ── Build and send Telegram summary ────────────────────────────────
-        pnl_sign  = "+" if total_pnl >= 0 else ""
-        pv_str    = f"${self._portfolio_value:,.2f}" if self._portfolio_value else "N/A"
-
-        lines = ["🔔 <b>END OF DAY SUMMARY</b>", ""]
-        lines.append(f"Total trades today: {total_trades}")
-        lines.append(f"Winning trades: {self._wins_today}")
-        lines.append(f"Losing trades:  {self._losses_today}")
-        lines.append("")
-        if closed:
-            lines.append("<b>Positions closed:</b>")
-            for c in closed:
-                sign = "+" if c["pnl"] >= 0 else ""
-                lines.append(f"  - {c['symbol']}: {sign}${c['pnl']:.2f}")
-            lines.append("")
-        lines.append(f"<b>Total P/L: {pnl_sign}${total_pnl:.2f}</b>")
-        lines.append(f"<b>Portfolio value: {pv_str}</b>")
-
-        await self._send_telegram("\n".join(lines))
-
-        # Publish EOD event so other bots can react
-        await self.publish(RedisConfig.CHANNEL_ALERTS, {
-            "type":      "eod_positions_closed",
-            "positions": closed,
-            "total_pnl": total_pnl,
-            "timestamp": datetime.utcnow().isoformat(),
+    async def _publish_halt_new_trades(self, reason: str = "EOD — no new positions"):
+        """Publish halt_new_trades to the order channel and update Redis gate."""
+        await self.publish(RedisConfig.CHANNEL_ORDERS, {
+            "type":   "halt_new_trades",
+            "reason": reason,
         })
+        await self.save_state("market_gate", {
+            "allow_new_trades": False,
+            "reason":           reason,
+            "timestamp":        datetime.utcnow().isoformat(),
+        }, ttl=7200)
+
+    # ── End-of-day position close (milestone sequence) ────────────────────────
+
+    async def _eod_close_task(self):
+        """
+        EOD close sequence — all times hardcoded EST (America/New_York).
+        Never relies on Alpaca market hours API.
+
+        Every weekday:
+          3:30pm — warning telegram + halt new trades
+          3:45pm — first close pass (Friday: primary close for weekend safety)
+          3:50pm — hard close remaining + cancel all open orders
+          3:55pm — verify zero positions + EOD telegram
+                   If any remain: circuit-breaker force close + critical alert
+
+        Friday only:
+          2:00pm — halt new trades early (weekend risk buffer)
+          (3:45-3:55 sequence same as above)
+        """
+        while self.running:
+            # Next weekday 3:30pm (or 2:00pm on Friday) as first wake-up
+            now_et    = self._now_et()
+            is_friday = now_et.weekday() == 4
+            first_h, first_m = (14, 0) if is_friday else (15, 30)
+
+            target = now_et.replace(hour=first_h, minute=first_m, second=0, microsecond=0)
+            if now_et >= target:
+                target += timedelta(days=1)
+            while target.weekday() >= 5:
+                target += timedelta(days=1)
+
+            wait_min = (target - self._now_et()).total_seconds() / 60
+            self.log(f"EOD close task: next run in {wait_min:.0f} min "
+                     f"({'Fri 2pm' if target.weekday() == 4 else '3:30pm'})")
+            await asyncio.sleep((target - self._now_et()).total_seconds())
+
+            now_et    = self._now_et()
+            is_friday = now_et.weekday() == 4
+
+            # ── 2:00pm Friday: stop new trades early ──────────────────────────
+            if is_friday and now_et.time() < EOD_WARN:
+                self.log("EOD: 2:00pm Friday — halting new trades for weekend safety")
+                await self._publish_halt_new_trades("Friday 2pm — weekend risk buffer, no new trades")
+                await self._send_telegram(
+                    f"📅 <b>Friday 2:00pm — No new trades for the rest of the day</b>\n"
+                    f"Extra buffer for weekend risk.\n"
+                    f"Positions will close at 3:45pm EST."
+                )
+                # Now sleep until 3:30pm for the warning
+                await self._sleep_until_et(15, 30)
+                now_et = self._now_et()
+
+            # ── 3:30pm: Closing warning ────────────────────────────────────────
+            self.log("EOD: 3:30pm — closing warning + halting new trades")
+            await self._publish_halt_new_trades("3:30pm EOD — no new positions accepted")
+            close_str = "3:45pm (Friday — weekend safety)" if is_friday else "3:50pm"
+            await self._send_telegram(
+                f"⏰ <b>Closing warning — {now_et.strftime('%A %b %d')}</b>\n"
+                f"No new trades accepted from 3:30pm.\n"
+                f"Positions begin closing at {close_str} EST.\n"
+                f"Hard close at 3:50pm EST no matter what."
+            )
+
+            # ── 3:45pm: First close pass ───────────────────────────────────────
+            await self._sleep_until_et(15, 45)
+            self.log(f"EOD: 3:45pm — starting position close {'(Friday primary)' if is_friday else ''}")
+            await self._send_telegram(
+                f"🔄 <b>{'Friday' if is_friday else 'EOD'} — closing all positions now "
+                f"({self._now_et().strftime('%I:%M %p')} EST)</b>"
+            )
+            closed, total_pnl = await self._close_all_market_positions("3:45pm")
+
+            # ── 3:50pm: Hard close remaining + cancel all orders ──────────────
+            await self._sleep_until_et(15, 50)
+            self.log("EOD: 3:50pm HARD CLOSE — force closing any remaining + cancel orders")
+            await self._cancel_all_orders_safe()
+            remaining = await self._get_positions_safe()
+            if remaining:
+                syms = [p["symbol"] for p in remaining]
+                self.log(f"EOD 3:50pm: {len(remaining)} still open — force closing: {syms}", "warning")
+                extra_closed, extra_pnl = await self._close_all_market_positions("3:50pm hard close")
+                existing_syms = {c["symbol"] for c in closed}
+                for c in extra_closed:
+                    if c["symbol"] not in existing_syms:
+                        closed.append(c)
+                        total_pnl += c["pnl"]
+
+            # ── 3:55pm: Verify zero positions + EOD telegram ──────────────────
+            await self._sleep_until_et(15, 55)
+            self.log("EOD: 3:55pm — verifying zero positions")
+            still_open    = await self._get_positions_safe()
+            verified_clear = not bool(still_open)
+
+            if still_open:
+                syms = [p["symbol"] for p in still_open]
+                self.log(
+                    f"EOD 3:55pm CRITICAL: {syms} still open — emergency force close!", "critical"
+                )
+                loop = asyncio.get_event_loop()
+                try:
+                    await loop.run_in_executor(None, self.alpaca.close_all_positions)
+                except Exception as e:
+                    self.log(f"EOD 3:55pm emergency close failed: {e}", "error")
+                await asyncio.sleep(5)
+                final_check = await self._get_positions_safe()
+                if final_check:
+                    await self._send_telegram(
+                        f"🚨 <b>CRITICAL — Positions STILL OPEN at 3:55pm!</b>\n"
+                        f"Symbols: {[p['symbol'] for p in final_check]}\n"
+                        f"Time: {self._now_et().strftime('%I:%M:%S %p')} EST\n"
+                        f"⚠️ Manual intervention required immediately!"
+                    )
+
+            # Tally win/loss
+            for c in closed:
+                if c.get("pnl", 0) > 0:
+                    self._wins_today   += 1
+                elif c.get("pnl", 0) < 0:
+                    self._losses_today += 1
+
+            total_trades = self._real_trades_today
+            self._real_trades_today = 0
+            await self._refresh_portfolio()
+
+            # Build and send EOD Telegram summary
+            pnl_sign = "+" if total_pnl >= 0 else ""
+            pv_str   = f"${self._portfolio_value:,.2f}" if self._portfolio_value else "N/A"
+            now_et   = self._now_et()
+
+            header = "📅 <b>FRIDAY — ALL POSITIONS CLOSED FOR WEEKEND</b>" if is_friday \
+                     else "🔔 <b>END OF DAY SUMMARY</b>"
+            lines = [header, f"<b>{now_et.strftime('%A, %b %d %Y')}</b>", ""]
+            lines += [
+                f"Total trades today: {total_trades}",
+                f"Winning trades:     {self._wins_today}",
+                f"Losing trades:      {self._losses_today}",
+                "",
+            ]
+            if closed:
+                lines.append("<b>Positions closed:</b>")
+                for c in closed:
+                    sign = "+" if c.get("pnl", 0) >= 0 else ""
+                    lines.append(f"  - {c['symbol']}: {sign}${c.get('pnl', 0):.2f}")
+                lines.append("")
+            lines += [
+                f"<b>Total P/L: {pnl_sign}${total_pnl:.2f}</b>",
+                f"<b>Portfolio value: {pv_str}</b>",
+                "",
+            ]
+            if verified_clear:
+                if is_friday:
+                    lines.append("All positions closed for the weekend ✅")
+                else:
+                    lines.append("All positions closed ✅")
+            else:
+                lines.append("⚠️ Some positions may still be open — check Alpaca dashboard!")
+
+            lines.append(f"Closed at: {now_et.strftime('%I:%M:%S %p')} EST")
+
+            # Late-alert detection: if this fires after 4pm, flag it as a bug
+            if now_et.time() >= MARKET_CLOSE:
+                self.log(
+                    f"EOD telegram sent at {now_et.strftime('%I:%M:%S %p')} — AFTER 4:00pm! "
+                    f"Timing bug — investigate immediately.", "critical"
+                )
+                lines += ["", "🚨 <b>WARNING: EOD alert sent AFTER 4:00pm!</b>",
+                          "This is a critical timing bug — please investigate."]
+
+            await self._send_telegram("\n".join(lines))
+
+            await self.publish(RedisConfig.CHANNEL_ALERTS, {
+                "type":       "eod_positions_closed",
+                "positions":  closed,
+                "total_pnl":  total_pnl,
+                "is_friday":  is_friday,
+                "verified":   verified_clear,
+                "timestamp":  datetime.utcnow().isoformat(),
+            })
+            self.log(
+                f"EOD complete | closed={len(closed)} | pnl={pnl_sign}${total_pnl:.2f} | "
+                f"verified_clear={verified_clear} | is_friday={is_friday}"
+            )
+
+    async def _backup_close_task(self):
+        """
+        Backup safety net: polls every 60 seconds between 3:45pm–4:00pm EST.
+        Force-closes any positions the main EOD logic may have missed.
+        Runs independently of _eod_close_task so a single failure can't block both.
+        """
+        while self.running:
+            now_et = self._now_et()
+            target = now_et.replace(hour=15, minute=45, second=0, microsecond=0)
+            if now_et >= target:
+                target += timedelta(days=1)
+            while target.weekday() >= 5:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - self._now_et()).total_seconds())
+
+            if self._now_et().weekday() >= 5:
+                continue
+
+            self.log("Backup close watcher: active (3:45–4:00pm)")
+            while self._now_et().time() < EOD_BACKUP_END:
+                positions = await self._get_positions_safe()
+                if positions:
+                    syms = [p["symbol"] for p in positions]
+                    self.log(
+                        f"Backup watcher: {len(positions)} position(s) still open at "
+                        f"{self._now_et().strftime('%I:%M:%S %p')} EST — {syms}", "warning"
+                    )
+                    await self._close_all_market_positions("backup_watcher")
+                await asyncio.sleep(60)
 
     # ── Command cycle ──────────────────────────────────────────────────────────
 
@@ -606,13 +762,12 @@ class MasterCommander(BaseBot):
         # ── Update regime ──────────────────────────────────────────────────────
         await self._update_regime()
 
-        # Market session
+        # Market session — hardcoded EST checks, no broker API
         session = self._get_market_session()
         if session != self._market_session:
             self.log(f"Market session: {self._market_session} → {session}")
             self._market_session = session
 
-            # Auto-halt outside market hours
             if session == "closed":
                 if not self._system_halted:
                     await self.publish(RedisConfig.CHANNEL_ORDERS, {
@@ -620,17 +775,40 @@ class MasterCommander(BaseBot):
                         "reason": "Market closed",
                     })
                     self.log("Auto-halt: market closed")
+                # Re-open the market gate for tomorrow
+                await self.save_state("market_gate", {
+                    "allow_new_trades": True,
+                    "reason":           "market_closed_reset",
+                    "timestamp":        datetime.utcnow().isoformat(),
+                }, ttl=86400)
 
             elif session == "open":
                 if self._system_halted:
                     self._system_halted  = False
                     self._halt_published = False
                     self.log("Market opened – trading resumed")
-                self._real_trades_today    = 0     # reset daily counter each open
-                self._halt_ignored_logged  = False # allow one warning next pre-market
-                self._consecutive_losses   = 0     # reset loss streak each day
-                self._wins_today           = 0
-                self._losses_today         = 0
+                self._real_trades_today   = 0
+                self._halt_ignored_logged = False
+                self._consecutive_losses  = 0
+                self._wins_today          = 0
+                self._losses_today        = 0
+                # Ensure gate is open at market open
+                await self.save_state("market_gate", {
+                    "allow_new_trades": True,
+                    "reason":           "market_open",
+                    "timestamp":        datetime.utcnow().isoformat(),
+                }, ttl=86400)
+
+            elif session in ("closing_soon", "friday_wind_down"):
+                # Publish halt_new_trades on transition (EOD task also sends at exact times;
+                # this catches the edge case where command_cycle fires exactly at the boundary)
+                reason = (
+                    "Friday 2pm wind-down — no new trades until Monday"
+                    if session == "friday_wind_down"
+                    else "3:30pm closing window — no new trades"
+                )
+                await self._publish_halt_new_trades(reason)
+                self.log(f"Market gate closed: {reason}")
 
         # Bot health
         bot_health = self._check_bot_health()
@@ -690,7 +868,7 @@ class MasterCommander(BaseBot):
                     f"Halted after {self._consecutive_losses} consecutive stop-loss triggers"
                 )
 
-        # ── AI review — only when data feeds have actual content ─────────────
+        # ── AI review — only during open session with real data ─────────────
         if self._market_session == "open" and not self._system_halted:
             data_available = any([
                 self._strategy_state,
