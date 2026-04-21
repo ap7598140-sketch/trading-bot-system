@@ -22,6 +22,21 @@ from loguru import logger
 class AlpacaClient:
     """Thin wrapper around alpaca-py SDK."""
 
+    @staticmethod
+    def _mask(key: str) -> str:
+        """Return a masked credential string for safe logging."""
+        if not key:
+            return "(not set)"
+        if len(key) <= 8:
+            return "***"
+        return f"{key[:4]}...{key[-4:]}"
+
+    @staticmethod
+    def _is_auth_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(k in msg for k in ("forbidden", "unauthorized", "403", "401",
+                                      "invalid key", "x-api-key", "authentication"))
+
     def __init__(self):
         self.trading = TradingClient(
             api_key=AlpacaConfig.API_KEY,
@@ -32,16 +47,31 @@ class AlpacaClient:
             api_key=AlpacaConfig.API_KEY,
             secret_key=AlpacaConfig.SECRET_KEY,
         )
-        logger.info(f"AlpacaClient initialised | paper={AlpacaConfig.PAPER}")
+        logger.info(
+            f"AlpacaClient initialised | paper={AlpacaConfig.PAPER} | "
+            f"api_key={self._mask(AlpacaConfig.API_KEY)} | "
+            f"secret_key={self._mask(AlpacaConfig.SECRET_KEY)}"
+        )
 
     # ── Account ────────────────────────────────────────────────────────────────
 
     def get_account(self) -> dict:
-        acct = self.trading.get_account()
+        try:
+            acct = self.trading.get_account()
+        except Exception as e:
+            if self._is_auth_error(e):
+                raise RuntimeError(
+                    f"Alpaca authentication failed — check your credentials.\n"
+                    f"  ALPACA_API_KEY    = {self._mask(AlpacaConfig.API_KEY)}\n"
+                    f"  ALPACA_SECRET_KEY = {self._mask(AlpacaConfig.SECRET_KEY)}\n"
+                    f"  BASE_URL          = {AlpacaConfig.BASE_URL}\n"
+                    f"  Original error: {e}"
+                ) from e
+            raise
         return {
-            "equity":        float(acct.equity),
-            "cash":          float(acct.cash),
-            "buying_power":  float(acct.buying_power),
+            "equity":          float(acct.equity),
+            "cash":            float(acct.cash),
+            "buying_power":    float(acct.buying_power),
             "portfolio_value": float(acct.portfolio_value),
             "day_trade_count": acct.daytrade_count,
         }
@@ -99,7 +129,17 @@ class AlpacaClient:
             start=start,
             end=end,
         )
-        bars = self.data.get_stock_bars(req)
+        try:
+            bars = self.data.get_stock_bars(req)
+        except Exception as e:
+            if self._is_auth_error(e):
+                raise RuntimeError(
+                    f"Alpaca data authentication failed — check your credentials.\n"
+                    f"  ALPACA_API_KEY    = {self._mask(AlpacaConfig.API_KEY)}\n"
+                    f"  ALPACA_SECRET_KEY = {self._mask(AlpacaConfig.SECRET_KEY)}\n"
+                    f"  Original error: {e}"
+                ) from e
+            raise
         result = {}
         bar_data = bars.data if hasattr(bars, "data") else bars
         for sym, bar_list in bar_data.items():

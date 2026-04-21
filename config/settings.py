@@ -145,7 +145,7 @@ class RegimeConfig:
     ALLOC_EUPHORIA  = 0.70
     ALLOC_BULL      = 0.95
     ALLOC_NEUTRAL   = 0.60
-    ALLOC_BEAR      = 0.25
+    ALLOC_BEAR      = 0.50
     ALLOC_CRASH     = 0.00
     ALLOC_UNCERTAIN = 0.50  # multiplier applied on top of regime scale when flickering
 

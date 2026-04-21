@@ -103,14 +103,14 @@ class RegimeDetector:
         euphoria → 0.70  (tighten stops)
         bull     → 0.95  (1.25× leverage max)
         neutral  → 0.60  (no leverage)
-        bear     → 0.25  (defensive only)
+        bear     → 0.50  (reduced size, still trade)
         crash    → 0.00  (close everything)
         """
         scales = {
             "euphoria": 0.70,
             "bull":     0.95,
             "neutral":  0.60,
-            "bear":     0.25,
+            "bear":     0.50,
             "crash":    0.00,
         }
         scale = scales.get(self._last_stable, 0.60)
@@ -176,7 +176,14 @@ class RegimeDetector:
         """
         Sort HMM states by mean log return (first feature), lowest → highest.
         Map to regime names ordered from most bearish to most bullish.
+
+        Bear threshold: a state is only labeled "bear" if its mean daily log
+        return is below -0.004 (~-0.4%/day, ~-2%/week). States above that
+        threshold but still negative are relabeled "neutral" so sideways/
+        mildly-negative markets don't block all trading.
         """
+        BEAR_THRESHOLD = -0.004   # mean daily log return required to be called "bear"
+
         means = [model.means_[i][0] for i in range(n)]
         order = np.argsort(means)  # ascending: most bearish first
 
@@ -189,4 +196,11 @@ class RegimeDetector:
             2: ["bear", "bull"],
         }
         names = name_sets.get(n, ["neutral"] * n)
-        return {int(order[i]): names[i] for i in range(n)}
+        mapping = {int(order[i]): names[i] for i in range(n)}
+
+        # Relabel "bear" states that don't meet the minimum negativity threshold
+        for state_idx, label in mapping.items():
+            if label == "bear" and model.means_[state_idx][0] > BEAR_THRESHOLD:
+                mapping[state_idx] = "neutral"
+
+        return mapping
