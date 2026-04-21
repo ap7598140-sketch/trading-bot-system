@@ -18,6 +18,7 @@ import anthropic
 
 from config import Models, RedisConfig, UniverseConfig, AnthropicConfig, AlertConfig
 from shared.base_bot import BaseBot
+from shared.llm_router import LLMRouter
 
 
 POLL_INTERVAL = 1200  # seconds between news fetches (20 min)
@@ -40,6 +41,7 @@ class NewsSentimentBot(BaseBot):
         self.news_api   = AlertConfig.NEWS_API_KEY
         self._seen_ids: set[str] = set()   # dedup headline IDs
         self._catalyst_scan_done: bool = False  # runs once at 9am per day
+        self._router = LLMRouter(self.client)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -124,39 +126,24 @@ class NewsSentimentBot(BaseBot):
         self.log(f"Catalyst scan complete | {len(catalysts)} high-priority events")
 
     async def _identify_catalysts(self, articles: list[dict]) -> list[dict]:
-        """Use Haiku to identify earnings/analyst/FDA/merger events from article list."""
-        items = [
-            {"title": a.get("title", ""), "summary": (a.get("description") or "")[:200]}
-            for a in articles[:50]   # cap to 50 to keep prompt size reasonable
-        ]
+        """Use Haiku to identify earnings/analyst/FDA/merger events. Cached 5 min."""
+        # Titles only — no summaries (saves ~60% tokens)
+        items = [{"i": i, "t": a.get("title", "")[:90]}
+                 for i, a in enumerate(articles[:30])]
+        ck = LLMRouter.cache_key(items)
         prompt = (
-            "You are a financial news analyst scanning pre-market news for high-priority catalysts.\n\n"
-            "Identify articles about:\n"
-            "  - Earnings beats or misses (EPS surprise)\n"
-            "  - Analyst upgrades or downgrades (rating changes, price target changes)\n"
-            "  - FDA approvals, rejections, or clinical trial results\n"
-            "  - Merger, acquisition, or buyout announcements\n\n"
-            f"Articles:\n{json.dumps(items)}\n\n"
-            "For each high-priority event found, extract:\n"
-            "  symbols (list of tickers affected), catalyst (type: earnings_beat/earnings_miss/"
-            "analyst_upgrade/analyst_downgrade/fda_approval/fda_rejection/merger), "
-            "sentiment (bullish/bearish), score (0.7-1.0), title (the headline)\n\n"
-            "ONLY include events with clear catalyst types listed above. Ignore general news.\n"
-            "Respond ONLY with JSON:\n"
-            "{\"catalysts\": [{\"symbols\": [\"AAPL\"], \"catalyst\": \"earnings_beat\", "
-            "\"sentiment\": \"bullish\", \"score\": 0.92, \"title\": \"...\"}]}"
+            "Find catalysts: earnings_beat/miss, analyst_upgrade/downgrade, "
+            "fda_approval/rejection, merger. Titles only:\n"
+            f"{LLMRouter.j(items)}\n"
+            "JSON:{\"catalysts\":[{\"symbols\":[],\"catalyst\":\"\","
+            "\"sentiment\":\"bullish\",\"score\":0.9,\"title\":\"\"}]}"
+        )
+        raw = await self._router.call(
+            [{"role": "user", "content": prompt}],
+            prefer="haiku", max_tokens=800, cache_key=ck,
         )
         try:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.client.messages.create(
-                    model=self.model,
-                    max_tokens=2000,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-            )
-            raw    = self._extract_json_block(response.content[0].text.strip())
-            parsed = json.loads(raw)
+            parsed = json.loads(self._extract_json_block(raw))
             return parsed.get("catalysts", [])
         except Exception as e:
             self.log(f"Catalyst identification error: {e}", "warning")
@@ -228,31 +215,22 @@ class NewsSentimentBot(BaseBot):
         if not articles:
             return []
 
-        items = [
-            {"id": i, "title": a.get("title", ""), "summary": a.get("description", "")[:300]}
-            for i, a in enumerate(articles)
-        ]
-
+        # Titles only (no 300-char summaries), cap at 15 — saves ~70% tokens
+        items = [{"id": i, "t": a.get("title", "")[:80]}
+                 for i, a in enumerate(articles[:15])]
+        ck = LLMRouter.cache_key(items)
         prompt = (
-            "You are a financial news sentiment analyser. "
-            "For each article, output a sentiment score and the tickers most affected.\n\n"
-            f"Articles: {json.dumps(items)}\n\n"
-            "Respond ONLY with JSON:\n"
-            "{\"results\": [{\"id\": 0, \"sentiment\": \"bullish|bearish|neutral\", "
-            "\"score\": 0.85, \"symbols\": [\"AAPL\"], \"catalyst\": \"earnings beat\"}]}\n"
-            "score is 0-1 confidence. catalyst is a short phrase (≤5 words)."
+            "Sentiment score each headline. Tickers affected.\n"
+            f"{LLMRouter.j(items)}\n"
+            "JSON:{\"results\":[{\"id\":0,\"sentiment\":\"bullish\","
+            "\"score\":0.85,\"symbols\":[],\"catalyst\":\"\"}]}"
         )
 
         try:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.client.messages.create(
-                    model=self.model,
-                    max_tokens=3000,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
+            raw = await self._router.call(
+                [{"role": "user", "content": prompt}],
+                prefer="haiku", max_tokens=800, cache_key=ck,
             )
-            raw = response.content[0].text.strip()
 
             # ── Robust JSON cleaning ────────────────────────────────────────
             # 1. Strip all markdown code fences

@@ -25,6 +25,7 @@ import pytz
 from config import Models, RedisConfig, UniverseConfig, AnthropicConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
+from shared.llm_router import LLMRouter
 
 MARKET_TZ = pytz.timezone("America/New_York")
 
@@ -189,6 +190,7 @@ class DataAgent(BaseBot):
         super().__init__(self.BOT_ID, self.NAME, Models.HAIKU)
         self.alpaca  = AlpacaClient()
         self.client  = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
+        self._router = LLMRouter(self.client)
         self.symbols = list(dict.fromkeys(UniverseConfig.WATCHLIST))   # deduplicated
         self._bar_cache: dict[str, list[dict]] = {}   # rolling bar history
         self._last_ai_scan: datetime | None = None   # throttle AI scan to 10-min intervals
@@ -332,40 +334,30 @@ class DataAgent(BaseBot):
 
     async def _ai_morning_analysis(self, candidates: list[dict],
                                    gap_ups: list[str], gap_downs: list[str]) -> list[dict]:
-        """ONE Claude Haiku call to pick the top 20 opportunities from raw scan data."""
+        """ONE Haiku call — picks top 20 opportunities. Compressed + cached."""
+        # Minify candidate data: key abbreviations, no indent
+        mini = [{"s": c["symbol"], "pct": c["pct_change"],
+                 "vr": c["vol_ratio"], "gap": c["gap_pct"]}
+                for c in candidates[:25]]
+        ck = LLMRouter.cache_key(mini, gap_ups[:10], gap_downs[:10])
         prompt = (
-            "You are a momentum trader scanning the market at 9am. "
-            "Select the TOP 20 best trading opportunities for today.\n\n"
-            f"Top candidates by momentum score:\n{json.dumps(candidates, indent=2)}\n\n"
-            f"Stocks gapping UP ≥2%:   {gap_ups}\n"
-            f"Stocks gapping DOWN ≥2%: {gap_downs}\n\n"
-            "Prioritize: large % moves with volume confirmation, clean gaps, high vol_ratio.\n"
-            "For each pick include: symbol, direction (long/short), reason (1 sentence), "
-            "priority (high/medium/low).\n\n"
-            "Respond ONLY with JSON:\n"
-            "{\"opportunities\": ["
-            "{\"symbol\": \"NVDA\", \"direction\": \"long\", "
-            "\"reason\": \"Gap up 3.2% on high volume — breakout continuation likely\", "
-            "\"priority\": \"high\"}"
-            "]}"
+            f"Top 20 trades from 9am scan. Long or short. JSON only.\n"
+            f"Cands:{LLMRouter.j(mini)}\n"
+            f"GapUp:{gap_ups[:8]} GapDn:{gap_downs[:8]}\n"
+            "JSON:{\"opportunities\":[{\"symbol\":\"\",\"direction\":\"long\","
+            "\"reason\":\"\",\"priority\":\"high\"}]}"
+        )
+        raw = await self._router.call(
+            [{"role": "user", "content": prompt}],
+            prefer="haiku", max_tokens=800, cache_key=ck,
         )
         try:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.client.messages.create(
-                    model=self.model,
-                    max_tokens=2000,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-            )
-            raw    = _clean_llm_json(response.content[0].text.strip())
-            parsed = json.loads(raw)
+            parsed = json.loads(_clean_llm_json(raw))
             return parsed.get("opportunities", [])[:20]
         except Exception as e:
             self.log(f"Morning AI analysis error: {e}", "warning")
-            # Fallback: return top 20 raw candidates as long picks
             return [{"symbol": c["symbol"], "direction": "long",
-                     "reason": f"pct={c['pct_change']:+.1f}% vol_ratio={c['vol_ratio']:.1f}x",
+                     "reason": f"pct={c['pct_change']:+.1f}% vr={c['vol_ratio']:.1f}x",
                      "priority": "medium"} for c in candidates[:20]]
 
     # ── Cache warm-up ──────────────────────────────────────────────────────────

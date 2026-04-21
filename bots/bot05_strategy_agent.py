@@ -19,6 +19,7 @@ import pytz
 from config import Models, RedisConfig, RiskConfig, AnthropicConfig, UniverseConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
+from shared.llm_router import LLMRouter
 
 MARKET_TZ = pytz.timezone("America/New_York")
 
@@ -39,6 +40,11 @@ class StrategyAgent(BaseBot):
         super().__init__(self.BOT_ID, self.NAME, Models.SONNET)
         self.client = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
         self.alpaca = AlpacaClient()
+        self._router = LLMRouter(
+            self.client,
+            save_fn=self.save_state,
+            get_fn=self.bus.get_state,
+        )
 
         # Signal buffers (reset each decision cycle)
         self._market_data: dict[str, dict]  = {}
@@ -281,68 +287,43 @@ class StrategyAgent(BaseBot):
     # ── AI strategy generation ─────────────────────────────────────────────────
 
     async def _generate_trade_setups(self, signals: dict) -> list[dict]:
-        """Use Sonnet to synthesise signals into actionable trade setups."""
+        """Use Sonnet (compressed prompt, cached) to synthesise signals into trade setups."""
 
-        # Use real portfolio value — refreshed from Alpaca before this cycle
-        PORTFOLIO    = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-        MAX_POSITION = min(round(PORTFOLIO * 0.15, 2), RiskConfig.MAX_SINGLE_POSITION_USD)
-        MAX_RISK     = round(PORTFOLIO * 0.01, 2)   # 1% of real portfolio
+        PV       = self._portfolio_value if self._portfolio_value > 0 else 1000.0
+        MAX_POS  = min(round(PV * 0.15, 0), RiskConfig.MAX_SINGLE_POSITION_USD)
+        MAX_RISK = round(PV * 0.01, 0)
+
+        # Compress signals to ~60-80 tokens (no raw history, no indented JSON)
+        compressed = LLMRouter.compress_signals(signals)
+        sector_tag = f"sector={self._strongest_sector}" if self._strongest_sector else ""
+        regime_tag = f"regime_scale={self._regime_scale:.0%} cb={self._cb_scale:.0%}"
+
+        # Cache key: hash of compressed signals + sizing params (not time-sensitive data)
+        ck = LLMRouter.cache_key(compressed, int(MAX_POS), sector_tag)
 
         prompt = (
-            "You are an expert stock trader synthesising real-time signals into trade setups.\n\n"
-            f"POSITION SIZING (HARD LIMITS — ${PORTFOLIO:,.0f} account):\n"
-            f"  • Max position_size_usd: ${MAX_POSITION:,.0f}  ← absolute ceiling, never exceed\n"
-            f"  • Max risk per trade:    ${MAX_RISK:,.0f}  (1% of portfolio)\n"
-            f"  • Sizing: shares = int({MAX_RISK:,.0f} / stop_distance), "
-            f"then position_size_usd = min(shares * entry, {MAX_POSITION:,.0f})\n"
-            f"  • Stop loss: {RiskConfig.STOP_LOSS_PCT*100:.0f}% from entry\n"
-            f"  • Take profit: {RiskConfig.TAKE_PROFIT_PCT*100:.0f}% from entry  (2:1 reward/risk)\n"
-            f"  • Max open positions: {RiskConfig.MAX_OPEN_POSITIONS}\n"
-            f"  • Max trades per day: {RiskConfig.MAX_DAILY_TRADES}\n"
-            f"  • Confidence threshold: {RiskConfig.CONFIDENCE_THRESHOLD}\n"
-            + (
-                f"\nSECTOR PRIORITY: Today's strongest sector is {self._strongest_sector}. "
-                f"Prefer setups in: {self._sector_symbols}. "
-                "Still include other high-conviction setups if signals are very strong.\n"
-                if self._strongest_sector else ""
-            )
-            + (
-                f"\nREGIME: {self._regime_scale:.0%} allocation active "
-                f"(CB scale={self._cb_scale:.0%}). "
-                "Position sizes already adjusted — do not override.\n"
-            )
-            + "\n"
-            "SIGNALS:\n"
-            f"{json.dumps(signals, indent=2)}\n\n"
-            "Generate up to 3 high-conviction trade setups. Each setup must include:\n"
-            "  - symbol, direction (long/short), entry_price, stop_loss, take_profit\n"
-            f"  - position_size_usd (must be <= {MAX_POSITION:,.0f})\n"
-            "  - confidence (0-1), timeframe (scalp/intraday/swing)\n"
-            "  - thesis (2-3 sentences explaining the confluence of signals)\n"
-            "  - required_confirmations (list of conditions that must be met before entry)\n"
-            "  - risk_reward_ratio\n\n"
-            "Only include setups with strong signal confluence (momentum + news or options).\n"
-            "Respond ONLY with JSON:\n"
-            "{\"setups\": [{\"symbol\": \"AAPL\", \"direction\": \"long\", "
-            "\"entry_price\": 195.50, \"stop_loss\": 191.59, \"take_profit\": 203.32, "
-            f"\"position_size_usd\": {MAX_POSITION:,.0f}, \"confidence\": 0.78, "
-            "\"timeframe\": \"intraday\", \"thesis\": \"...\", "
-            "\"required_confirmations\": [\"price above VWAP\", \"RSI > 55\"], "
-            "\"risk_reward_ratio\": 2.0}], "
-            "\"market_bias\": \"bullish|bearish|neutral\", "
-            "\"notes\": \"brief market commentary\"}"
+            f"Expert trader. Output 1-3 setups. "
+            f"Acct=${PV:.0f} MaxPos=${MAX_POS:.0f} MaxRisk=${MAX_RISK:.0f} "
+            f"SL=1% TP=2% conf>={RiskConfig.CONFIDENCE_THRESHOLD}. "
+            + (f"{sector_tag} " if sector_tag else "")
+            + f"{regime_tag}.\n"
+            f"Signals:{LLMRouter.j(compressed)}\n"
+            "JSON:{\"setups\":[{\"symbol\":\"X\",\"direction\":\"long\","
+            "\"entry_price\":0,\"confidence\":0.7,\"timeframe\":\"intraday\","
+            "\"thesis\":\"\",\"required_confirmations\":[]}],"
+            "\"market_bias\":\"neutral\",\"notes\":\"\"}"
         )
 
+        raw = await self._router.call(
+            [{"role": "user", "content": prompt}],
+            prefer="sonnet",
+            max_tokens=600,
+            cache_key=ck,
+        )
+        if not raw:
+            return [], "neutral", ""
+
         try:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.client.messages.create(
-                    model=self.model,
-                    max_tokens=2048,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-            )
-            raw = response.content[0].text.strip()
             if "```" in raw:
                 raw = raw.split("```")[1].lstrip("json").strip()
             parsed = json.loads(raw)

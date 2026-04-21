@@ -20,6 +20,7 @@ import pytz
 
 from config import Models, RedisConfig, UniverseConfig, AnthropicConfig
 from shared.base_bot import BaseBot
+from shared.llm_router import LLMRouter
 
 MARKET_TZ = pytz.timezone("America/New_York")
 
@@ -39,7 +40,8 @@ class MomentumScanner(BaseBot):
 
     def __init__(self):
         super().__init__(self.BOT_ID, self.NAME, Models.HAIKU)
-        self.client = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
+        self.client  = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
+        self._router = LLMRouter(self.client)
         # Latest data packet per symbol (written by _on_market_data)
         self._latest: dict[str, dict] = {}
         # Daily watchlist — set at 9am, watched all day, updated next morning
@@ -265,45 +267,29 @@ class MomentumScanner(BaseBot):
     # ── AI narrative ───────────────────────────────────────────────────────────
 
     async def _ai_narrative(self, top_signals: list[dict]) -> dict[str, str]:
-        """Generate brief momentum narratives for top signals using Haiku."""
+        """One-sentence momentum narrative per symbol. Haiku, cached 5 min."""
         if not top_signals:
             return {}
-
+        # Compress to key metrics only — no full signal objects
         items = [
-            {
-                "sym":   s["symbol"],
-                "score": s["score"],
-                "grade": s["grade"],
-                "dir":   s["direction"],
-                "rsi":   s.get("rsi_14"),
-                "trend": s.get("trend_dir"),
-                "bb":    s.get("pct_b"),
-                "vol":   s.get("volume_ratio"),
-            }
+            {"s": s["symbol"], "d": s["direction"][0], "g": s["grade"],
+             "r": s.get("rsi_14"), "v": s.get("volume_ratio")}
             for s in top_signals
         ]
-
+        ck     = LLMRouter.cache_key(items)
         prompt = (
-            "You are a momentum trader. Write a 1-sentence momentum narrative for each symbol.\n\n"
-            f"Signals: {json.dumps(items)}\n\n"
-            "Respond ONLY with JSON: "
-            "{\"narratives\": {\"AAPL\": \"Strong uptrend with volume confirmation...\"}}"
+            f"1-sentence momentum narrative per symbol.\n"
+            f"{LLMRouter.j(items)}\n"
+            "JSON:{\"narratives\":{\"SYM\":\"\"}}"
         )
-
+        raw = await self._router.call(
+            [{"role": "user", "content": prompt}],
+            prefer="haiku", max_tokens=300, cache_key=ck,
+        )
         try:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.client.messages.create(
-                    model=self.model,
-                    max_tokens=512,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-            )
-            raw = response.content[0].text.strip()
             if "```" in raw:
                 raw = raw.split("```")[1].lstrip("json").strip()
-            parsed = json.loads(raw)
-            return parsed.get("narratives", {})
+            return json.loads(raw).get("narratives", {})
         except Exception as e:
             self.log(f"AI narrative error: {e}", "warning")
             return {}

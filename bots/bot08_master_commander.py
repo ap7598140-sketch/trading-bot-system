@@ -25,6 +25,7 @@ from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 from shared.circuit_breaker import CircuitBreaker, CBState
 from shared.regime_detector import RegimeDetector
+from shared.llm_router import LLMRouter
 
 
 COMMAND_INTERVAL  = 300   # seconds between commander reviews (5 min)
@@ -75,6 +76,11 @@ class MasterCommander(BaseBot):
         super().__init__(self.BOT_ID, self.NAME, Models.SONNET)
         self.client = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
         self.alpaca = AlpacaClient()
+        self._router = LLMRouter(
+            self.client,
+            save_fn=self.save_state,
+            get_fn=self.bus.get_state,
+        )
 
         # Bot health tracking
         self._heartbeats: dict[int, str] = {}       # bot_id → last_seen ISO
@@ -322,49 +328,35 @@ class MasterCommander(BaseBot):
 
     async def _ai_command_review(self, system_state: dict) -> dict:
         """
-        Sonnet reviews full system state and issues high-level commands.
-        This is the strategic override layer.
+        Sonnet reviews compressed system state (~75 tokens) and issues commands.
+        Cached for 5 min — same conditions = same response, zero extra Sonnet cost.
+        Only called when market is open and data feeds have content.
         """
+        summary = LLMRouter.compress_system_state(system_state)
+        ck      = LLMRouter.cache_key(summary)
+
         prompt = (
-            "You are the Master Commander of an AI trading system. "
-            "Review the system state and issue commands.\n\n"
-            f"SYSTEM STATE:\n{json.dumps(system_state, indent=2)}\n\n"
-            "IMPORTANT RULES:\n"
-            "- NEVER recommend halt or pause because data feeds (strategy/momentum/news) are empty. "
-            "Empty data feeds are normal — bots update on their own schedule.\n"
-            "- ONLY recommend halt if daily_pnl_pct is worse than -3.0% (financial loss only).\n"
-            "- Default session_action to 'continue' unless there is a clear financial emergency.\n\n"
-            "Assess:\n"
-            "1. Are risk levels acceptable based on portfolio P/L only?\n"
-            "2. Are there any bots that appear to be malfunctioning?\n"
-            "3. Any strategic adjustments needed?\n\n"
-            "Respond ONLY with JSON:\n"
-            "{\"trading_allowed\": true, "
-            "\"confidence\": 0.85, "
-            "\"commands\": [\"string\"], "
-            "\"risk_level\": \"low|medium|high|critical\", "
-            "\"session_action\": \"continue|close_all\", "
-            "\"notes\": \"brief commentary\", "
-            "\"alert_operator\": false, "
-            "\"operator_message\": \"\"}"
+            "Commander. Only halt if pnl<-3%. Ignore empty data feeds.\n"
+            f"{summary}\n"
+            "JSON:{\"trading_allowed\":true,\"risk_level\":\"low\","
+            "\"session_action\":\"continue\",\"alert_operator\":false,"
+            "\"operator_message\":\"\",\"notes\":\"\"}"
         )
 
+        raw = await self._router.call(
+            [{"role": "user", "content": prompt}],
+            prefer="sonnet",
+            max_tokens=150,
+            cache_key=ck,
+        )
+        if not raw:
+            return {"trading_allowed": not self._system_halted,
+                    "session_action": "continue", "risk_level": "medium", "notes": ""}
         try:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.client.messages.create(
-                    model=self.model,
-                    max_tokens=2000,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-            )
-            raw = response.content[0].text.strip()
-            # Robust cleaning: strip fences, comments, trailing commas
             raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
             raw = re.sub(r"//[^\n]*", "", raw)
             raw = re.sub(r",\s*([}\]])", r"\1", raw)
             raw = re.sub(r",\s*([}\]])", r"\1", raw)
-            # Bracket-tracking extraction of first complete {...}
             start = raw.find("{")
             if start != -1:
                 depth, in_str, escape, end = 0, False, False, -1
@@ -380,16 +372,10 @@ class MasterCommander(BaseBot):
                 if end != -1:
                     raw = raw[start:end + 1]
             return json.loads(raw)
-        except json.JSONDecodeError:
-            pass   # silent fallback below
         except Exception as e:
-            self.log(f"AI command review error: {e}", "warning")
-            return {
-                "trading_allowed": not self._system_halted,
-                "session_action":  "continue",
-                "risk_level":      "medium",
-                "notes":           "AI review failed – maintaining current state",
-            }
+            self.log(f"AI review parse error: {e}", "warning")
+            return {"trading_allowed": not self._system_halted,
+                    "session_action": "continue", "risk_level": "medium", "notes": ""}
 
     # ── Emergency halt ─────────────────────────────────────────────────────────
 
