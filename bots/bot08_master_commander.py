@@ -59,6 +59,7 @@ BOT_REGISTRY = {
     10: "Backtesting Bot",
     11: "Strategy Builder",
     12: "Research Bot",
+    13: "Telegram Controller",
 }
 
 

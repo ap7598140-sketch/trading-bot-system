@@ -291,7 +291,7 @@ class TelegramController(BaseBot):
             f"Day P/L:   {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_pct:.2f}%)",
             f"Regime:    {regime.get('name','?')} (scale={regime.get('scale',1.0):.2f})",
             f"Circuit:   L{cb.get('level',0)} — {cb.get('action','continue')}",
-            f"Bots alive: {alive}/12",
+            f"Bots alive: {alive}/{len(bhealth)}",
         ]
         if dead:
             lines.append(f"⚠️ Dead bots: {', '.join(dead)}")
