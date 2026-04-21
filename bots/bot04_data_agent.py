@@ -22,7 +22,7 @@ import pandas as pd
 from alpaca.data.timeframe import TimeFrame
 
 import pytz
-from config import Models, RedisConfig, UniverseConfig, AnthropicConfig
+from config import Models, RedisConfig, UniverseConfig, AnthropicConfig, RiskConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 from shared.llm_router import LLMRouter
@@ -195,11 +195,13 @@ class DataAgent(BaseBot):
         self._bar_cache: dict[str, list[dict]] = {}   # rolling bar history
         self._last_ai_scan: datetime | None = None   # throttle AI scan to 10-min intervals
         self._morning_scan_done: bool = False   # runs once per day at 9am
+        self._premarket_scan_done: bool = False  # runs once per day at 8am
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def setup(self):
         self.log(f"Data Agent starting | watching {len(self.symbols)} symbols")
+        asyncio.create_task(self._premarket_scan_task())
         asyncio.create_task(self._morning_scan_task())
         await self._warm_cache()
 
@@ -231,6 +233,157 @@ class DataAgent(BaseBot):
                     raise
             except Exception:
                 raise   # non-connection errors bubble up immediately
+
+    # ── 8am Pre-market scan (runs ONCE per day) ───────────────────────────────
+
+    async def _premarket_scan_task(self):
+        """Sleep until 8:00am EST, score all universe symbols 1-100, publish watchlist."""
+        while self.running:
+            now_et = datetime.now(MARKET_TZ)
+            target = now_et.replace(hour=8, minute=0, second=0, microsecond=0)
+            if now_et >= target:
+                target += timedelta(days=1)
+            while target.weekday() >= 5:
+                target += timedelta(days=1)
+            self.log(f"Premarket scan scheduled in {(target - now_et).total_seconds()/60:.1f} min")
+            await asyncio.sleep((target - now_et).total_seconds())
+            if datetime.now(MARKET_TZ).weekday() >= 5:
+                continue
+            self._premarket_scan_done = False
+            await self._run_premarket_scan()
+            self._premarket_scan_done = True
+
+    def _score_symbol(self, sym: str) -> int:
+        """
+        Score a symbol 1-100 using cached daily bars.
+
+        Points breakdown (max 100):
+          25 – Recent price momentum (yesterday vs prior close)
+          20 – Volume strength vs 20-day average
+          15 – RSI setup (sweet spot 45-70)
+          15 – MACD bullish histogram
+          15 – Gap-up indicator
+          10 – Proximity to recent 90-day high
+        """
+        bars = self._bar_cache.get(sym, [])
+        if len(bars) < 5:
+            return 0
+
+        closes  = [b["close"]  for b in bars]
+        highs   = [b["high"]   for b in bars]
+        volumes = [b["volume"] for b in bars]
+
+        score = 0
+
+        # 1. Price momentum (25 pts)
+        if len(closes) >= 2 and closes[-2] > 0:
+            pct = (closes[-1] - closes[-2]) / closes[-2] * 100
+            if pct > 5:    score += 25
+            elif pct > 2:  score += 15
+            elif pct > 0:  score += 5
+            elif pct < -2: score -= 10
+
+        # 2. Volume strength (20 pts)
+        if len(volumes) >= 20:
+            avg_vol = float(np.mean(volumes[-20:]))
+            if avg_vol > 0:
+                vr = volumes[-1] / avg_vol
+                if vr > 3:    score += 20
+                elif vr > 2:  score += 15
+                elif vr > 1.5: score += 10
+
+        # 3. RSI setup (15 pts)
+        rsi = calc_rsi(closes, 14)
+        if rsi is not None:
+            if 45 <= rsi <= 70:   score += 15
+            elif 35 <= rsi < 45:  score += 8   # oversold recovery
+            elif rsi > 80:        score -= 10  # overbought
+
+        # 4. MACD bullish (15 pts)
+        macd = calc_macd(closes)
+        if macd.get("histogram") is not None:
+            if macd["histogram"] > 0:
+                score += 15
+            elif (macd.get("macd") is not None and macd.get("signal") is not None
+                  and macd["macd"] > macd["signal"]):
+                score += 7   # crossing up
+
+        # 5. Gap up (15 pts)
+        if len(bars) >= 2 and bars[-2]["close"] > 0:
+            gap = (bars[-1]["open"] - bars[-2]["close"]) / bars[-2]["close"] * 100
+            if gap > 3:    score += 15
+            elif gap > 2:  score += 10
+            elif gap > 1:  score += 5
+
+        # 6. Near recent high (10 pts)
+        if len(highs) >= 10:
+            recent_high = max(highs[-min(63, len(highs)):])  # ~3-month high
+            if recent_high > 0 and closes[-1] >= recent_high * 0.98:
+                score += 10
+            elif recent_high > 0 and closes[-1] >= recent_high * 0.95:
+                score += 5
+
+        return max(0, min(score, 100))
+
+    async def _run_premarket_scan(self):
+        """
+        Score every symbol in SCAN_UNIVERSE + BEAR_ETFS.
+        Save scored watchlist to Redis for bot05 and bot08 to consume.
+        Publish top picks to market_data channel.
+        """
+        all_syms = list(dict.fromkeys(
+            UniverseConfig.SCAN_UNIVERSE + UniverseConfig.BEAR_ETFS
+        ))
+
+        # Refresh bar cache for accurate scores
+        start = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%d")
+        try:
+            from alpaca.data.timeframe import TimeFrame
+            bars = await self._retry(
+                lambda: self.alpaca.get_bars(all_syms, TimeFrame.Day, start),
+                "premarket_scan_bars",
+            )
+            for sym, bar_list in bars.items():
+                if bar_list:
+                    existing = self._bar_cache.get(sym, [])
+                    self._bar_cache[sym] = (existing + bar_list)[-200:]
+        except Exception as e:
+            self.log(f"Premarket scan bar refresh failed (using cached): {e}", "warning")
+
+        # Score every symbol
+        scored = []
+        for sym in all_syms:
+            s = self._score_symbol(sym)
+            bars = self._bar_cache.get(sym, [])
+            price = round(bars[-1]["close"], 2) if bars else 0
+            if s > 0:
+                scored.append({"symbol": sym, "score": s, "price": price})
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        top_picks = [s for s in scored if s["score"] >= RiskConfig.MIN_STOCK_SCORE]
+
+        await self.save_state("premarket_scan", {
+            "scored":    scored[:40],
+            "top_picks": top_picks,
+            "threshold": RiskConfig.MIN_STOCK_SCORE,
+            "timestamp": datetime.utcnow().isoformat(),
+        }, ttl=3600 * 8)
+
+        self.log(
+            f"Premarket scan: {len(scored)} symbols scored | "
+            f"{len(top_picks)} qualify (score ≥ {RiskConfig.MIN_STOCK_SCORE}) | "
+            f"top3={[s['symbol'] for s in top_picks[:3]]}"
+        )
+
+        # Publish top picks so downstream bots react immediately
+        for pick in top_picks[:15]:
+            await self.publish(RedisConfig.CHANNEL_MARKET_DATA, {
+                "type":      "premarket_pick",
+                "symbol":    pick["symbol"],
+                "score":     pick["score"],
+                "price":     pick["price"],
+                "timestamp": datetime.utcnow().isoformat(),
+            })
 
     # ── 9am Morning scan (runs ONCE per day) ──────────────────────────────────
 

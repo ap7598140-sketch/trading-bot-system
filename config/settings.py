@@ -58,23 +58,33 @@ class RedisConfig:
 class RiskConfig:
     MAX_POSITION_SIZE       = float(os.getenv("MAX_POSITION_SIZE", "10000"))
     MAX_PORTFOLIO_RISK      = float(os.getenv("MAX_PORTFOLIO_RISK", "0.025"))
-    MAX_DAILY_LOSS          = 0.05    # 5% daily loss limit
+    MAX_DAILY_LOSS          = 0.05    # 5% daily loss limit (portfolio %)
     MAX_OPEN_POSITIONS      = 10      # max simultaneous open positions
     MAX_DAILY_TRADES        = 20      # max orders submitted per day
-    MAX_SINGLE_POSITION_USD = 1000.0  # hard $1,000 cap per individual trade
-    CONFIDENCE_THRESHOLD    = 0.55    # minimum confidence to approve a trade
-    STOP_LOSS_PCT           = 0.01    # 1% stop loss
-    TAKE_PROFIT_PCT         = 0.02    # 2% take profit  →  2:1 reward/risk
+    MAX_SINGLE_POSITION_USD = 500.0   # hard $500 cap per individual trade
+    CONFIDENCE_THRESHOLD    = 0.80    # minimum confidence to approve a trade
+    STOP_LOSS_PCT           = 0.06    # 6% stop  →  ~$30 loss on $500 position
+    TAKE_PROFIT_PCT         = 0.12    # 12% take →  ~$60 profit  (2:1 RR)
     MAX_SECTOR_EXPOSURE     = 0.30    # 30% in any one sector
+    # Smart selection thresholds
+    MIN_STOCK_SCORE         = 70      # premarket score required (1–100)
+    MIN_WINNER_CRITERIA     = 4       # of 6 criteria that must pass
+    MAX_TRADE_LOSS_USD      = 30.0    # hard dollar cap per trade loss
+    DAILY_LOSS_LIMIT_USD    = 50.0    # halt trading after $50 daily loss
+    MIN_TRADE_PROFIT_USD    = 50.0    # minimum target profit per trade
 
 
 # ── Trading universe ───────────────────────────────────────────────────────────
 class UniverseConfig:
+    # Inverse ETFs for bear/crash regime
+    BEAR_ETFS = ["SQQQ", "SPXS", "SOXS"]
+
     # Core watchlist (continuously monitored)
     WATCHLIST = [
         "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
         "META", "TSLA", "SPY",  "QQQ",  "AMD",
         "NFLX", "JPM",  "BAC",  "GS",   "COIN",
+        "SQQQ", "SPXS", "SOXS",   # inverse ETFs for bear regime
     ]
 
     # Expanded universe for the 9am morning scan (top volume/gap candidates)
@@ -103,6 +113,8 @@ class UniverseConfig:
         "XLK", "XLF", "XLE", "XLV", "XLI", "XLY",
         # Broad market ETFs
         "SPY", "QQQ", "IWM",
+        # Inverse ETFs (bear/crash regime)
+        "SQQQ", "SPXS", "SOXS",
     ]
 
     # Sector ETF → member symbols mapping (for sector filter in bot05)

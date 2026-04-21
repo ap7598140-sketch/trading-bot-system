@@ -57,6 +57,8 @@ class StrategyAgent(BaseBot):
         self._sector_symbols: list[str]      = []    # symbols in strongest sector
         self._regime_scale: float            = 1.0   # from bot08 Redis state
         self._cb_scale: float                = 1.0   # circuit breaker position scale
+        self._current_regime: str            = "neutral"  # from bot08 regime state
+        self._premarket_scores: dict[str, int] = {}       # symbol → 1-100 score from bot04
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -201,8 +203,9 @@ class StrategyAgent(BaseBot):
         """Read regime allocation scale, circuit breaker scale, and market gate from Redis."""
         try:
             regime_state = await self.bus.get_state("bot8:regime") or {}
-            self._regime_scale = float(regime_state.get("scale", 1.0))
-            if regime_state.get("regime") == "crash":
+            self._regime_scale    = float(regime_state.get("scale", 1.0))
+            self._current_regime  = regime_state.get("regime", "neutral")
+            if self._current_regime == "crash":
                 self._regime_scale = 0.0
         except Exception:
             pass
@@ -224,38 +227,191 @@ class StrategyAgent(BaseBot):
 
     # ── Position sizing ────────────────────────────────────────────────────────
 
+    def _regime_sl_tp(self) -> tuple[float, float]:
+        """Return (stop_loss_pct, take_profit_pct) adjusted for current regime.
+        Euphoria tightens stops to limit to ~$10 max loss per trade."""
+        if self._current_regime == "euphoria":
+            return 0.02, 0.04   # $10 max loss on $500 position in hot market
+        return RiskConfig.STOP_LOSS_PCT, RiskConfig.TAKE_PROFIT_PCT  # 6%, 12%
+
     def _safe_position_size(self, entry, stop_loss) -> float:
         """
-        Size based on real Alpaca portfolio value, scaled by regime + circuit breaker.
-          max_position = 15% portfolio × regime_scale × cb_scale, cap $1,000
-          max_risk     = 1% portfolio
-          shares       = int(max_risk / stop_distance)
-          position_usd = min(shares * entry, max_position)
+        Size by hard dollar risk: max $30 loss per trade, max $500 position.
+        Scaled down by regime × circuit breaker multiplier.
         """
-        pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-
-        # Combined scale: regime allocation × circuit breaker
-        combined_scale = self._regime_scale * self._cb_scale
-        combined_scale = max(0.0, min(combined_scale, 1.0))  # clamp [0, 1]
-
-        max_position_usd = (
-            min(pv * 0.15, RiskConfig.MAX_SINGLE_POSITION_USD) * combined_scale
-        )
-        max_risk_usd = pv * 0.01
+        combined_scale = max(0.0, min(self._regime_scale * self._cb_scale, 1.0))
+        max_position_usd = RiskConfig.MAX_SINGLE_POSITION_USD * combined_scale
+        max_risk_usd     = RiskConfig.MAX_TRADE_LOSS_USD   # hard $30 cap
 
         entry     = float(entry or 0)
         stop_loss = float(stop_loss or 0)
 
         if entry <= 0 or stop_loss <= 0:
-            return round(max_risk_usd * combined_scale, 2)
+            return round(max_risk_usd, 2)
 
         stop_distance = abs(entry - stop_loss)
         if stop_distance <= 0:
-            return round(max_risk_usd * combined_scale, 2)
+            return round(max_risk_usd, 2)
 
         shares       = int(max_risk_usd / stop_distance)
         position_usd = min(shares * entry, max_position_usd)
         return round(position_usd, 2)
+
+    # ── Premarket scores ───────────────────────────────────────────────────────
+
+    async def _load_premarket_scores(self):
+        """Pull bot04's 8am premarket scores into local cache."""
+        try:
+            scan = await self.bus.get_state("bot4:premarket_scan") or {}
+            scored = scan.get("scored", [])
+            self._premarket_scores = {s["symbol"]: s["score"] for s in scored}
+            if self._premarket_scores:
+                self.log(
+                    f"Premarket scores loaded: {len(self._premarket_scores)} symbols | "
+                    f"top3={sorted(self._premarket_scores, key=self._premarket_scores.get, reverse=True)[:3]}"
+                )
+        except Exception as e:
+            self.log(f"Premarket score load error: {e}", "warning")
+
+    # ── Winner criteria gate ───────────────────────────────────────────────────
+
+    def _check_winner_criteria(self, setup: dict) -> dict:
+        """
+        Evaluate the 6 winner criteria for a proposed setup.
+        Returns {"passed": bool, "criteria_met": int, "reasons": [], "failures": []}
+
+        Criteria:
+          1. Premarket stock score >= 70/100
+          2. News or momentum catalyst exists
+          3. Momentum confirmed (3 of 5 checks pass)
+          4. In the day's strongest sector (or bear ETF in bear regime)
+          5. Market regime permits this trade direction
+          6. AI confidence >= 80%
+        """
+        sym        = setup.get("symbol", "")
+        confidence = float(setup.get("confidence") or 0)
+        direction  = (setup.get("direction") or "long").lower()
+
+        criteria_met = 0
+        reasons  = []
+        failures = []
+
+        # ── 1. Premarket score ────────────────────────────────────────────────
+        stock_score = self._premarket_scores.get(sym, 0)
+        if stock_score == 0:
+            # No premarket scan data yet — give benefit of the doubt
+            criteria_met += 1
+            reasons.append("score=unscored(pass)")
+        elif stock_score >= RiskConfig.MIN_STOCK_SCORE:
+            criteria_met += 1
+            reasons.append(f"score={stock_score}/100")
+        else:
+            failures.append(f"score={stock_score}<{RiskConfig.MIN_STOCK_SCORE}")
+
+        # ── 2. Catalyst (news bullish OR strong momentum grade A/B) ──────────
+        has_catalyst = False
+        catalyst_desc = ""
+        for n in self._news_signals[-20:]:
+            if sym in (n.get("symbols") or []) and n.get("sentiment") == "bullish":
+                has_catalyst = True
+                catalyst_desc = n.get("catalyst") or n.get("title", "")[:40] or "news_bullish"
+                break
+        if not has_catalyst:
+            for m in self._momentum_signals[-20:]:
+                if m.get("symbol") == sym and m.get("grade") in ("A", "B", "A+"):
+                    has_catalyst = True
+                    catalyst_desc = f"momentum_grade={m['grade']}"
+                    break
+        if not has_catalyst and self._strongest_sector:
+            # Sector rotation is itself a valid catalyst
+            if sym in self._sector_symbols:
+                has_catalyst = True
+                catalyst_desc = f"sector_rotation={self._strongest_sector}"
+        if has_catalyst:
+            criteria_met += 1
+            reasons.append(f"catalyst:{catalyst_desc[:30]}")
+            setup.setdefault("catalyst", catalyst_desc)
+        else:
+            failures.append("no_catalyst")
+
+        # ── 3. Momentum confirmation (3 of 5 checks) ─────────────────────────
+        md  = self._market_data.get(sym, {})
+        ind = md.get("indicators", {}) if md else {}
+        price = md.get("price", 0) or 0
+        mom_checks = 0
+
+        if price and ind.get("sma_20") and price > ind["sma_20"]:
+            mom_checks += 1  # above 20-day MA
+        if ind.get("volume_ratio") and ind["volume_ratio"] > 1.0:
+            mom_checks += 1  # above average volume
+        rsi = ind.get("rsi_14")
+        if rsi and 45 <= rsi <= 70:
+            mom_checks += 1  # RSI in bullish range
+        macd = ind.get("macd") or {}
+        if macd.get("histogram") and macd["histogram"] > 0:
+            mom_checks += 1  # MACD bullish
+        vwap = ind.get("vwap")
+        if vwap and price and price > vwap:
+            mom_checks += 1  # price above VWAP (up on the day)
+
+        if mom_checks >= 3:
+            criteria_met += 1
+            reasons.append(f"momentum={mom_checks}/5")
+        else:
+            failures.append(f"momentum={mom_checks}/5<3")
+
+        # ── 4. Right sector ───────────────────────────────────────────────────
+        if self._current_regime in ("bear", "crash"):
+            if sym in UniverseConfig.BEAR_ETFS:
+                criteria_met += 1
+                reasons.append("bear_etf_sector")
+            else:
+                failures.append("bear_regime_no_longs")
+        elif not self._strongest_sector or sym in self._sector_symbols:
+            criteria_met += 1
+            reasons.append(f"sector={self._strongest_sector or 'any'}")
+        elif sym in ("AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "SPY", "QQQ"):
+            # Mega-caps allowed regardless of sector rotation
+            criteria_met += 1
+            reasons.append("mega_cap_pass")
+        else:
+            failures.append(f"wrong_sector(want={self._strongest_sector})")
+
+        # ── 5. Regime allows this trade direction ─────────────────────────────
+        if self._current_regime == "crash":
+            failures.append("crash_all_blocked")
+        elif self._current_regime == "bear":
+            if direction == "long" and sym not in UniverseConfig.BEAR_ETFS:
+                failures.append("bear_blocks_long_non_inverse")
+            else:
+                criteria_met += 1
+                reasons.append("regime=bear_inverse_ok")
+        elif self._current_regime == "neutral":
+            # Neutral: only trade if score is high (85+) OR already has 3 other criteria
+            if stock_score >= 85 or criteria_met >= 3:
+                criteria_met += 1
+                reasons.append(f"regime=neutral_ok(score={stock_score})")
+            else:
+                failures.append(f"neutral_requires_score85+(got={stock_score})")
+        else:
+            criteria_met += 1
+            reasons.append(f"regime={self._current_regime}_ok")
+
+        # ── 6. AI confidence ──────────────────────────────────────────────────
+        if confidence >= RiskConfig.CONFIDENCE_THRESHOLD:
+            criteria_met += 1
+            reasons.append(f"conf={confidence:.0%}")
+        else:
+            failures.append(f"conf={confidence:.0%}<{RiskConfig.CONFIDENCE_THRESHOLD:.0%}")
+
+        passed = criteria_met >= RiskConfig.MIN_WINNER_CRITERIA
+        return {
+            "passed":       passed,
+            "criteria_met": criteria_met,
+            "stock_score":  stock_score,
+            "reasons":      reasons,
+            "failures":     failures,
+        }
 
     # ── Signal aggregation ─────────────────────────────────────────────────────
 
@@ -321,28 +477,34 @@ class StrategyAgent(BaseBot):
     async def _generate_trade_setups(self, signals: dict) -> list[dict]:
         """Use Sonnet (compressed prompt, cached) to synthesise signals into trade setups."""
 
-        PV       = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-        MAX_POS  = min(round(PV * 0.15, 0), RiskConfig.MAX_SINGLE_POSITION_USD)
-        MAX_RISK = round(PV * 0.01, 0)
+        PV      = self._portfolio_value if self._portfolio_value > 0 else 1000.0
+        MAX_POS = RiskConfig.MAX_SINGLE_POSITION_USD
+        sl_pct, tp_pct = self._regime_sl_tp()
 
         # Compress signals to ~60-80 tokens (no raw history, no indented JSON)
         compressed = LLMRouter.compress_signals(signals)
         sector_tag = f"sector={self._strongest_sector}" if self._strongest_sector else ""
-        regime_tag = f"regime_scale={self._regime_scale:.0%} cb={self._cb_scale:.0%}"
+        regime_tag = f"regime={self._current_regime} scale={self._regime_scale:.0%} cb={self._cb_scale:.0%}"
 
-        # Cache key: hash of compressed signals + sizing params (not time-sensitive data)
-        ck = LLMRouter.cache_key(compressed, int(MAX_POS), sector_tag)
+        # Bear/crash: restrict to inverse ETFs only
+        bear_note = ""
+        if self._current_regime in ("bear", "crash"):
+            bear_note = f"BEAR REGIME: ONLY suggest inverse ETFs {UniverseConfig.BEAR_ETFS}. Long only on these. "
+
+        # Cache key: hash of compressed signals + sizing params
+        ck = LLMRouter.cache_key(compressed, int(MAX_POS), sector_tag, self._current_regime)
 
         prompt = (
             f"Expert trader. Output 1-3 setups. "
-            f"Acct=${PV:.0f} MaxPos=${MAX_POS:.0f} MaxRisk=${MAX_RISK:.0f} "
-            f"SL=1% TP=2% conf>={RiskConfig.CONFIDENCE_THRESHOLD}. "
+            f"Acct=${PV:.0f} MaxPos=${MAX_POS:.0f} MaxLoss=${RiskConfig.MAX_TRADE_LOSS_USD:.0f} "
+            f"SL={sl_pct*100:.0f}% TP={tp_pct*100:.0f}% conf>={RiskConfig.CONFIDENCE_THRESHOLD}. "
             + (f"{sector_tag} " if sector_tag else "")
-            + f"{regime_tag}.\n"
+            + f"{regime_tag}. {bear_note}"
+            f"Each setup MUST include a 'catalyst' field explaining WHY (earnings/upgrade/momentum/rotation).\n"
             f"Signals:{LLMRouter.j(compressed)}\n"
             "JSON:{\"setups\":[{\"symbol\":\"X\",\"direction\":\"long\","
-            "\"entry_price\":0,\"confidence\":0.7,\"timeframe\":\"intraday\","
-            "\"thesis\":\"\",\"required_confirmations\":[]}],"
+            "\"entry_price\":0,\"confidence\":0.8,\"timeframe\":\"intraday\","
+            "\"thesis\":\"\",\"catalyst\":\"\",\"required_confirmations\":[]}],"
             "\"market_bias\":\"neutral\",\"notes\":\"\"}"
         )
 
@@ -372,13 +534,14 @@ class StrategyAgent(BaseBot):
                     self.log(f"Dropped setup for {s.get('symbol')}: entry_price=0", "warning")
                     continue
 
-                # 2:1 reward-to-risk — always calculated, never from AI
+                # Stop/take always calculated from config — never trust AI values
+                sl_pct, tp_pct = self._regime_sl_tp()
                 if direction == "long":
-                    s["stop_loss"]   = round(entry * 0.99, 4)   # 1% risk
-                    s["take_profit"] = round(entry * 1.02, 4)   # 2% reward
+                    s["stop_loss"]   = round(entry * (1 - sl_pct), 4)
+                    s["take_profit"] = round(entry * (1 + tp_pct), 4)
                 else:  # short
-                    s["stop_loss"]   = round(entry * 1.01, 4)   # 1% risk
-                    s["take_profit"] = round(entry * 0.98, 4)   # 2% reward
+                    s["stop_loss"]   = round(entry * (1 + sl_pct), 4)
+                    s["take_profit"] = round(entry * (1 - tp_pct), 4)
 
                 # Recalculate position size using the corrected stop_loss
                 ai_size = s.get("position_size_usd", "?")
@@ -395,7 +558,8 @@ class StrategyAgent(BaseBot):
                 self.log(
                     f"Setup enforced: {s.get('symbol')} {direction} "
                     f"entry={entry} sl={s['stop_loss']} tp={s['take_profit']} "
-                    f"size AI=${ai_size} → ${s['position_size_usd']}"
+                    f"size AI=${ai_size} → ${s['position_size_usd']} | "
+                    f"catalyst={s.get('catalyst','none')[:40]}"
                 )
                 valid_setups.append(s)
 
@@ -414,17 +578,34 @@ class StrategyAgent(BaseBot):
 
         await self._refresh_portfolio()
         await self._refresh_scales()
+        await self._load_premarket_scores()
 
         # CB scale or market gate set to 0 → no new trades this cycle
         if self._cb_scale == 0.0:
             self.log("New trades blocked (circuit breaker or market gate). Skipping cycle.", "warning")
             return
 
+        # Daily loss limit: stop trading once $50 is lost today
+        try:
+            dashboard = await self.bus.get_state("bot8:dashboard") or {}
+            daily_pnl = float(dashboard.get("daily_pnl", 0))
+            if daily_pnl < -RiskConfig.DAILY_LOSS_LIMIT_USD:
+                self.log(
+                    f"Daily loss limit hit: ${abs(daily_pnl):.2f} > "
+                    f"${RiskConfig.DAILY_LOSS_LIMIT_USD:.0f} — no new trades today",
+                    "warning",
+                )
+                return
+        except Exception:
+            pass
+
         signals = self._aggregate_signals()
 
         self.log(
-            f"Decision cycle | momentum={len(self._momentum_signals)} "
-            f"news={len(self._news_signals)} options={len(self._options_signals)}"
+            f"Decision cycle | regime={self._current_regime} "
+            f"momentum={len(self._momentum_signals)} "
+            f"news={len(self._news_signals)} options={len(self._options_signals)} "
+            f"premarket_scores={len(self._premarket_scores)}"
         )
 
         # Require at least one signal type — momentum alone is sufficient to trade
@@ -435,29 +616,72 @@ class StrategyAgent(BaseBot):
             )
             return
 
+        # In bear/crash regime, inject inverse ETF data into momentum signals
+        if self._current_regime in ("bear", "crash"):
+            for etf in UniverseConfig.BEAR_ETFS:
+                md = self._market_data.get(etf, {})
+                if md:
+                    signals["momentum"].insert(0, {
+                        "symbol":    etf,
+                        "direction": "long",
+                        "score":     0.8,
+                        "grade":     "B",
+                        "reason":    f"bear_regime_inverse_etf",
+                    })
+
         result = await self._generate_trade_setups(signals)
         setups, market_bias, notes = result
 
         if not setups:
             self.log(f"No setups generated | market_bias={market_bias}")
         else:
-            pv = self._portfolio_value if self._portfolio_value > 0 else 1000.0
-            max_pos_cap = min(pv * 0.15, RiskConfig.MAX_SINGLE_POSITION_USD)
+            approved  = []
+            rejected  = []
             for setup in setups:
-                # Final hard cap — catches any edge case before hitting the wire
+                # Final hard cap on position size
                 setup["position_size_usd"] = min(
-                    float(setup.get("position_size_usd") or pv * 0.01), max_pos_cap
+                    float(setup.get("position_size_usd") or RiskConfig.MAX_TRADE_LOSS_USD),
+                    RiskConfig.MAX_SINGLE_POSITION_USD,
                 )
+
+                # Winner criteria gate (min 4 of 6)
+                result = self._check_winner_criteria(setup)
+                setup["winner_score"]    = result["criteria_met"]
+                setup["winner_reasons"]  = result["reasons"]
+                setup["winner_failures"] = result["failures"]
+
+                if result["passed"]:
+                    approved.append(setup)
+                    self.log(
+                        f"APPROVED {setup.get('symbol')} {setup.get('direction')} | "
+                        f"criteria={result['criteria_met']}/6 | "
+                        f"catalyst={setup.get('catalyst','?')[:40]} | "
+                        f"{','.join(result['reasons'])}"
+                    )
+                else:
+                    rejected.append(setup.get("symbol"))
+                    self.log(
+                        f"REJECTED {setup.get('symbol')} | "
+                        f"criteria={result['criteria_met']}/6 < {RiskConfig.MIN_WINNER_CRITERIA} | "
+                        f"failed: {','.join(result['failures'])}",
+                        "warning",
+                    )
+
+            if rejected:
+                self.log(f"Winner criteria rejected: {rejected}")
+
+            for setup in approved:
                 await self.publish(RedisConfig.CHANNEL_STRATEGY, {
-                    "type":         "trade_setup",
-                    "market_bias":  market_bias,
+                    "type":        "trade_setup",
+                    "market_bias": market_bias,
                     **setup,
                 })
                 self.log(
-                    f"Trade setup: {setup.get('symbol')} {setup.get('direction')} | "
-                    f"conf={setup.get('confidence')} | RR={setup.get('risk_reward_ratio')} | "
-                    f"{setup.get('thesis', '')[:80]}"
+                    f"Trade setup published: {setup.get('symbol')} {setup.get('direction')} | "
+                    f"conf={setup.get('confidence')} | "
+                    f"WHY: {setup.get('catalyst') or setup.get('thesis', '')[:80]}"
                 )
+            setups = approved
 
         # Save strategy state
         await self.save_state("latest", {

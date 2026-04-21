@@ -127,6 +127,7 @@ class MasterCommander(BaseBot):
         asyncio.create_task(self._backup_close_task())
         asyncio.create_task(self._regime_train_task())
         asyncio.create_task(self._dashboard_refresh_task())
+        asyncio.create_task(self._daily_report_task())
         await self._refresh_portfolio()
         self._session_start_val = self._portfolio_value
         self._cb.set_week_start(self._portfolio_value)
@@ -483,6 +484,145 @@ class MasterCommander(BaseBot):
                     self.log(f"Telegram send failed: {resp.status_code}", "warning")
         except Exception as e:
             self.log(f"Telegram error: {e}", "warning")
+
+    # ── Scheduled daily reports ────────────────────────────────────────────────
+
+    async def _daily_report_task(self):
+        """
+        Sends Telegram reports at three fixed times each weekday (EST):
+          8:30am — morning watchlist (from bot04 premarket scan)
+          10:00am — first trade update
+          12:00pm — midday P&L
+        (3:55pm EOD summary is handled by _eod_close_task)
+        """
+        REPORTS = [
+            (8, 30, "morning_watchlist"),
+            (10, 0,  "first_trade_update"),
+            (12, 0,  "midday_pnl"),
+        ]
+
+        while self.running:
+            now_et = self._now_et()
+            next_time  = None
+            next_label = None
+
+            for h, m, label in REPORTS:
+                t = now_et.replace(hour=h, minute=m, second=0, microsecond=0)
+                if now_et < t:
+                    next_time  = t
+                    next_label = label
+                    break
+
+            if next_time is None:
+                # All today's reports done — sleep until 8:30am next weekday
+                next_time = (now_et + timedelta(days=1)).replace(
+                    hour=8, minute=30, second=0, microsecond=0
+                )
+                while next_time.weekday() >= 5:
+                    next_time += timedelta(days=1)
+                next_label = "morning_watchlist"
+
+            secs = (next_time - self._now_et()).total_seconds()
+            if secs > 0:
+                await asyncio.sleep(secs)
+
+            if self._now_et().weekday() >= 5:
+                continue  # weekend — skip
+
+            try:
+                await self._send_scheduled_report(next_label)
+            except Exception as e:
+                self.log(f"Daily report error ({next_label}): {e}", "warning")
+
+    async def _send_scheduled_report(self, report_type: str):
+        """Build and send a scheduled Telegram report."""
+        now_et = self._now_et()
+
+        if report_type == "morning_watchlist":
+            premarket  = await self.bus.get_state("bot4:premarket_scan") or {}
+            top_picks  = premarket.get("top_picks", [])
+            threshold  = premarket.get("threshold", 70)
+            regime_lbl = f"{self._current_regime.upper()} (scale {self._regime_scale:.0%})"
+
+            lines = [
+                "📊 <b>8:30am Morning Watchlist</b>",
+                f"<b>{now_et.strftime('%A, %b %d %Y')}</b>",
+                f"Regime: {regime_lbl}",
+                f"Sector leader: {self._strategy_state.get('sector', 'detecting...')}",
+                "",
+            ]
+            if top_picks:
+                lines.append(f"<b>Top picks (score ≥ {threshold}/100):</b>")
+                for p in top_picks[:12]:
+                    lines.append(
+                        f"  {p['symbol']}: {p['score']}/100 @ ${p.get('price', '?')}"
+                    )
+                lines.append("")
+                if self._current_regime in ("bear", "crash"):
+                    lines.append("⚠️ Bear regime — inverse ETFs only (SQQQ/SPXS/SOXS)")
+            else:
+                lines.append(
+                    "No stocks qualify today (score < 70).\n"
+                    "System will wait for better setups. No forced trades."
+                )
+            lines.append("\nTrading opens at 9:30am EST.")
+            await self._send_telegram("\n".join(lines))
+
+        elif report_type == "first_trade_update":
+            await self._refresh_portfolio()
+            positions  = await self._get_positions_safe()
+            strategy   = await self.bus.get_state("bot5:latest") or {}
+            pnl_sign   = "+" if self._daily_pnl >= 0 else ""
+            pv_str     = f"${self._portfolio_value:,.2f}"
+
+            lines = [
+                "📈 <b>10:00am — First Trade Update</b>",
+                f"<b>{now_et.strftime('%A, %b %d %Y')}</b>",
+                "",
+                f"P/L so far:     {pnl_sign}${self._daily_pnl:.2f}",
+                f"Portfolio:      {pv_str}",
+                f"Open positions: {len(positions)}",
+                f"Setups today:   {strategy.get('setup_count', 0)}",
+                f"Market bias:    {strategy.get('market_bias', 'neutral')}",
+            ]
+            if positions:
+                lines.append("\n<b>Open positions:</b>")
+                for p in positions[:8]:
+                    pl   = float(p.get("unrealized_pl", 0))
+                    sign = "+" if pl >= 0 else ""
+                    lines.append(f"  {p['symbol']}: {sign}${pl:.2f}")
+            else:
+                lines.append("\nNo open positions yet.")
+            await self._send_telegram("\n".join(lines))
+
+        elif report_type == "midday_pnl":
+            await self._refresh_portfolio()
+            positions = await self._get_positions_safe()
+            pnl_sign  = "+" if self._daily_pnl >= 0 else ""
+            pv_str    = f"${self._portfolio_value:,.2f}"
+            pnl_pct   = (
+                round(self._daily_pnl / self._session_start_val * 100, 2)
+                if self._session_start_val > 0 else 0
+            )
+
+            lines = [
+                "🕛 <b>12:00pm Midday P&L Report</b>",
+                f"<b>{now_et.strftime('%A, %b %d %Y')}</b>",
+                "",
+                f"P/L:            {pnl_sign}${self._daily_pnl:.2f} ({pnl_sign}{pnl_pct:.1f}%)",
+                f"Portfolio:      {pv_str}",
+                f"Open positions: {len(positions)}",
+                f"Trades today:   {self._real_trades_today}",
+                f"W / L:          {self._wins_today} / {self._losses_today}",
+            ]
+            if positions:
+                lines.append("\n<b>Positions:</b>")
+                for p in positions[:8]:
+                    pl   = float(p.get("unrealized_pl", 0))
+                    sign = "+" if pl >= 0 else ""
+                    lines.append(f"  {p['symbol']}: {sign}${pl:.2f}")
+            lines.append("\n3:30pm — no new trades. 3:45pm — positions begin closing.")
+            await self._send_telegram("\n".join(lines))
 
     # ── EOD helper methods ─────────────────────────────────────────────────────
 
