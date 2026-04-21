@@ -130,6 +130,19 @@ class MasterCommander(BaseBot):
         await self._refresh_portfolio()
         self._session_start_val = self._portfolio_value
         self._cb.set_week_start(self._portfolio_value)
+
+        # ── Always start ACTIVE — never inherit stale halt state from Redis ──
+        # A previous EOD close or manual /stop leaves market_gate=False in Redis
+        # for up to 24 hours. Clear it immediately so trading resumes on restart.
+        self._system_halted  = False
+        self._halt_published = False
+        await self.save_state("market_gate", {
+            "allow_new_trades": True,
+            "reason":           "startup_reset",
+            "timestamp":        datetime.utcnow().isoformat(),
+        }, ttl=86400)
+        self.log("Trading gate reset to ACTIVE on startup")
+
         # Write dashboard immediately so /status works before first command cycle
         self._market_session = self._get_market_session()
         await self.save_state("dashboard", self._build_dashboard(), ttl=90)

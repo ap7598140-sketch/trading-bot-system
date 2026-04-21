@@ -13,3 +13,4 @@ data/*.json
 .DS_Store
 LOCKFILE.lock
 telegram_bot.lock
+system.lock
