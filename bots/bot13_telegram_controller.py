@@ -18,13 +18,14 @@ from typing import Optional
 
 import httpx
 
-from config import AlertConfig, RedisConfig, AlpacaConfig
+from config import AlertConfig, RedisConfig, AlpacaConfig, BASE_DIR
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 
 
 POLL_TIMEOUT  = 30   # long-polling timeout (seconds)
 POLL_INTERVAL = 1    # sleep between poll attempts on error
+LOCK_FILE     = os.path.join(BASE_DIR, "telegram_bot.lock")
 
 
 class TelegramController(BaseBot):
@@ -53,13 +54,40 @@ class TelegramController(BaseBot):
         if not self._authorized_id:
             self.log("TELEGRAM_CHAT_ID not set — controller disabled", "warning")
             return
+
+        # ── Lock file: prevent 409 from two instances polling simultaneously ──
+        if os.path.exists(LOCK_FILE):
+            try:
+                pid = int(open(LOCK_FILE).read().strip())
+                # Check if that process is still running
+                os.kill(pid, 0)
+                self.log(
+                    f"Telegram lock file exists (PID {pid} is running) — "
+                    "another instance is already polling. This instance will idle.",
+                    "warning",
+                )
+                self._token = ""   # disable polling for this instance
+                return
+            except (ProcessLookupError, ValueError, OSError):
+                # Stale lock — previous process died without cleanup
+                self.log("Stale lock file found — removing and taking over", "warning")
+                os.remove(LOCK_FILE)
+
+        with open(LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        self.log(f"Telegram lock acquired (PID {os.getpid()}) → {LOCK_FILE}")
+
+        # ── Clear any active webhook before starting long-poll ────────────────
+        # A registered webhook causes 409 Conflict on getUpdates.
+        await self._delete_webhook()
+        await asyncio.sleep(2)
+
         self.log(
             f"Telegram Controller ready | authorized_chat={self._authorized_id}"
         )
 
     async def run(self):
         if not self._token or not self._authorized_id:
-            # Sit idle rather than crash the system
             while self.running:
                 await asyncio.sleep(60)
             return
@@ -77,9 +105,36 @@ class TelegramController(BaseBot):
                     await asyncio.sleep(POLL_INTERVAL)
 
     async def cleanup(self):
+        # Release the lock so the next startup can proceed
+        try:
+            if os.path.exists(LOCK_FILE):
+                pid = int(open(LOCK_FILE).read().strip())
+                if pid == os.getpid():
+                    os.remove(LOCK_FILE)
+                    self.log("Telegram lock released")
+        except Exception:
+            pass
         self.log("Telegram Controller stopped")
 
     # ── Telegram API helpers ───────────────────────────────────────────────────
+
+    async def _delete_webhook(self):
+        """
+        Call Telegram deleteWebhook before starting long-poll.
+        A registered webhook causes 409 Conflict on every getUpdates call.
+        drop_pending_updates=False preserves queued messages.
+        """
+        url = f"https://api.telegram.org/bot{self._token}/deleteWebhook"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(url, json={"drop_pending_updates": False})
+                data = resp.json()
+                if data.get("ok"):
+                    self.log("Webhook deleted — safe to start long-polling")
+                else:
+                    self.log(f"deleteWebhook response: {data}", "warning")
+        except Exception as e:
+            self.log(f"deleteWebhook error: {e}", "warning")
 
     async def _get_updates(self, client: httpx.AsyncClient) -> list[dict]:
         url = f"https://api.telegram.org/bot{self._token}/getUpdates"
@@ -87,6 +142,15 @@ class TelegramController(BaseBot):
             "offset":  self._update_offset,
             "timeout": POLL_TIMEOUT,
         })
+        if resp.status_code == 409:
+            self.log(
+                "409 Conflict on getUpdates — another instance is polling or a webhook "
+                "is still active. Calling deleteWebhook and waiting 5 s before retry.",
+                "warning",
+            )
+            await self._delete_webhook()
+            await asyncio.sleep(5)
+            return []
         if resp.status_code != 200:
             self.log(f"getUpdates error {resp.status_code}", "warning")
             return []

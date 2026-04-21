@@ -11,3 +11,5 @@ data/*.csv
 data/*.json
 *.pkl
 .DS_Store
+LOCKFILE.lock
+telegram_bot.lock
