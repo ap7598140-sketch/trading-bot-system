@@ -14,6 +14,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Optional
 
+
 import pytz
 
 import anthropic
@@ -142,24 +143,79 @@ class ExecutionAgent(BaseBot):
             )
             return
 
-        # Buying power check before placing order
+        # ── Live price validation (CRITICAL — must run before any sizing) ────────
+        live_price = await self._fetch_live_price(sym, side)
+        if live_price is None:
+            self.log(
+                f"REJECTED {sym}: Alpaca returned no live price — "
+                f"refusing to place order with stale cached price ${entry:.2f}",
+                "warning",
+            )
+            await self.publish(RedisConfig.CHANNEL_ALERTS, {
+                "type":   "order_rejected_no_live_price",
+                "symbol": sym,
+                "reason": "Could not fetch live price from Alpaca",
+            })
+            return
+
+        drift = abs(entry - live_price) / live_price
+        self.log(
+            f"Price validation: cached=${entry:.4f} | live=${live_price:.4f} | "
+            f"drift={drift*100:.2f}% | side={side}"
+        )
+        if drift > 0.02:
+            self.log(
+                f"REJECTED {sym}: price drift {drift*100:.1f}% exceeds 2% limit "
+                f"(cached=${entry:.2f}, live=${live_price:.2f}) — order cancelled",
+                "warning",
+            )
+            await self.publish(RedisConfig.CHANNEL_ALERTS, {
+                "type":         "order_rejected_price_drift",
+                "symbol":       sym,
+                "cached_price": entry,
+                "live_price":   live_price,
+                "drift_pct":    round(drift * 100, 2),
+                "reason":       f"Price drift {drift*100:.1f}% > 2% — stale data rejected",
+            })
+            return
+
+        # Recalculate stop/take from live price using the same % that bot05 used.
+        # Extract implied pcts from the setup (prevents stale SL/TP hitting the wire).
+        stale_stop = float(setup.get("stop_loss")  or 0)
+        stale_tp   = float(setup.get("take_profit") or 0)
+        sl_pct = abs(stale_stop - entry) / entry if entry > 0 and stale_stop > 0 else RiskConfig.STOP_LOSS_PCT
+        tp_pct = abs(stale_tp   - entry) / entry if entry > 0 and stale_tp   > 0 else RiskConfig.TAKE_PROFIT_PCT
+
+        if side == "buy":
+            live_stop = round(live_price * (1 - sl_pct), 4)
+            live_tp   = round(live_price * (1 + tp_pct), 4)
+        else:
+            live_stop = round(live_price * (1 + sl_pct), 4)
+            live_tp   = round(live_price * (1 - tp_pct), 4)
+
+        # Overwrite setup with live values — downstream code uses these
+        setup["entry_price"] = live_price
+        setup["stop_loss"]   = live_stop
+        setup["take_profit"] = live_tp
+        entry = live_price   # local alias used below
+
+        # ── Buying power check ────────────────────────────────────────────────
         try:
             loop    = asyncio.get_event_loop()
             account = await loop.run_in_executor(None, self.alpaca.get_account)
             buying_power = float(account.get("buying_power", 0))
-            cost_basis   = float(size_usd)
-            if buying_power < cost_basis:
+            if buying_power < float(size_usd):
                 self.log(
                     f"SKIPPED {sym}: insufficient buying power "
-                    f"(${buying_power:,.2f} available, ${cost_basis:,.2f} needed)",
-                    "warning"
+                    f"(${buying_power:,.2f} available, ${size_usd:,.2f} needed)",
+                    "warning",
                 )
                 return
-            self.log(f"Buying power OK: ${buying_power:,.2f} available for ${cost_basis:,.2f} order")
+            self.log(f"Buying power OK: ${buying_power:,.2f} available for ${size_usd:,.2f}")
         except Exception as e:
             self.log(f"Buying power check failed: {e} — proceeding anyway", "warning")
 
-        # Calculate share quantity
+        # Share count always based on live price — never the stale AI entry
         shares = max(1, int(size_usd / entry))
 
         # AI order routing: market vs limit
@@ -219,6 +275,23 @@ class ExecutionAgent(BaseBot):
                 "symbol": sym,
                 "error":  str(e),
             })
+
+    # ── Live price fetcher ─────────────────────────────────────────────────────
+
+    async def _fetch_live_price(self, symbol: str, side: str = "buy") -> Optional[float]:
+        """
+        Fetch real-time ask (buy) or bid (sell) price from Alpaca.
+        Returns None if Alpaca is unreachable — callers must treat None as a hard block.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            price = await loop.run_in_executor(
+                None, lambda: self.alpaca.get_live_price(symbol, side)
+            )
+            return price
+        except Exception as e:
+            self.log(f"Live price fetch error for {symbol}: {e}", "warning")
+            return None
 
     # ── AI order type decision ─────────────────────────────────────────────────
 

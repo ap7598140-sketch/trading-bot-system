@@ -12,8 +12,9 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame
+from typing import Optional
 
 from config import AlpacaConfig
 from loguru import logger
@@ -106,6 +107,32 @@ class AlpacaClient:
         ]
 
     # ── Market data ────────────────────────────────────────────────────────────
+
+    def get_live_price(self, symbol: str, side: str = "buy") -> Optional[float]:
+        """
+        Fetch the real-time best price for one symbol from Alpaca.
+        Returns ask for buy orders, bid for sell orders, None on failure.
+        This is the ONLY safe price source for order sizing.
+        """
+        try:
+            req    = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+            quotes = self.data.get_stock_latest_quote(req)
+            q      = quotes.get(symbol)
+            if q is None:
+                return None
+            if side == "sell":
+                p = float(q.bid_price) if q.bid_price else None
+            else:
+                p = float(q.ask_price) if q.ask_price else None
+            # Fall back to last trade price if quote is absent
+            if not p or p <= 0:
+                treq   = StockLatestTradeRequest(symbol_or_symbols=[symbol])
+                trades = self.data.get_stock_latest_trade(treq)
+                t      = trades.get(symbol)
+                p      = float(t.price) if t and t.price else None
+            return p
+        except Exception:
+            return None
 
     def get_latest_quotes(self, symbols: list[str]) -> dict:
         req = StockLatestQuoteRequest(symbol_or_symbols=symbols)
