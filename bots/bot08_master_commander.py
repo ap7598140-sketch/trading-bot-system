@@ -125,9 +125,13 @@ class MasterCommander(BaseBot):
         asyncio.create_task(self._eod_close_task())
         asyncio.create_task(self._backup_close_task())
         asyncio.create_task(self._regime_train_task())
+        asyncio.create_task(self._dashboard_refresh_task())
         await self._refresh_portfolio()
         self._session_start_val = self._portfolio_value
         self._cb.set_week_start(self._portfolio_value)
+        # Write dashboard immediately so /status works before first command cycle
+        self._market_session = self._get_market_session()
+        await self.save_state("dashboard", self._build_dashboard(), ttl=90)
         self.log(
             f"Master Commander online | portfolio=${self._portfolio_value:,.2f} | "
             f"paper={True}"
@@ -740,6 +744,64 @@ class MasterCommander(BaseBot):
                     await self._close_all_market_positions("backup_watcher")
                 await asyncio.sleep(60)
 
+    # ── Dashboard helpers ──────────────────────────────────────────────────────
+
+    def _build_dashboard(self) -> dict:
+        """
+        Snapshot of all in-memory state — used for the initial write and the
+        60-second refresh task. Does NOT call Alpaca or Redis.
+        """
+        bot_health = self._check_bot_health()
+        dead_bots  = [bid for bid, s in bot_health.items() if s == "dead"]
+        cb = self._cb_state
+        return {
+            "timestamp":       datetime.utcnow().isoformat(),
+            "market_session":  self._market_session,
+            "system_halted":   self._system_halted,
+            "portfolio_value": self._portfolio_value,
+            "daily_pnl":       self._daily_pnl,
+            "daily_pnl_pct":   round(self._daily_pnl / self._session_start_val * 100, 2)
+                               if self._session_start_val > 0 else 0,
+            "bot_health":      {BOT_REGISTRY.get(k, k): v for k, v in bot_health.items()},
+            "dead_bots":       dead_bots,
+            "risk":            self._risk_stats,
+            "strategy":        self._strategy_state,
+            "momentum":        self._momentum_board,
+            "news":            self._news_summary,
+            "circuit_breaker": {
+                "level":          cb.level if cb else 0,
+                "action":         cb.action if cb else "continue",
+                "position_scale": cb.position_scale if cb else 1.0,
+                "reason":         cb.reason if cb else "",
+            },
+            "regime": {
+                "name":      self._current_regime,
+                "scale":     self._regime_scale,
+                "uncertain": self._regime.is_uncertain(),
+                "trained":   self._regime_trained,
+            },
+        }
+
+    async def _dashboard_refresh_task(self):
+        """
+        Writes dashboard to Redis every 60 s regardless of market session.
+        Keeps /status responsive at all hours and prevents the key from
+        expiring between the 300-second command cycles.
+        Only hits Alpaca for portfolio refresh during active market sessions.
+        """
+        await asyncio.sleep(10)   # let setup() finish first
+        while self.running:
+            try:
+                # Refresh portfolio value from Alpaca during active sessions
+                if self._market_session not in ("closed", "after_hours"):
+                    await self._refresh_portfolio()
+                # Always update session (may have transitioned while market closed)
+                self._market_session = self._get_market_session()
+                await self.save_state("dashboard", self._build_dashboard(), ttl=90)
+            except Exception as e:
+                self.log(f"Dashboard refresh error: {e}", "warning")
+            await asyncio.sleep(60)
+
     # ── Command cycle ──────────────────────────────────────────────────────────
 
     async def _command_cycle(self):
@@ -926,8 +988,8 @@ class MasterCommander(BaseBot):
                 system_state["commander_risk_level"] = risk_level
                 system_state["commander_notes"]      = decision.get("notes", "")
 
-        # Save dashboard state (for external monitoring)
-        await self.save_state("dashboard", system_state, ttl=60)
+        # Save full dashboard state (refresh task also writes every 60 s)
+        await self.save_state("dashboard", system_state, ttl=90)
 
         cb_lvl = self._cb_state.level if self._cb_state else 0
         self.log(
