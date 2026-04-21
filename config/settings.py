@@ -51,6 +51,7 @@ class RedisConfig:
     CHANNEL_BACKTEST      = "backtest_results"
     CHANNEL_RESEARCH      = "research"
     CHANNEL_HEARTBEAT     = "heartbeat"
+    CHANNEL_CONTROL       = "system_control"   # Telegram controller → Bot 8
 
 
 # ── Risk limits ────────────────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 """
-System launcher – starts all 12 bots as concurrent asyncio tasks.
+System launcher – starts all 13 bots as concurrent asyncio tasks.
 Run: python scripts/run_system.py
 """
 
@@ -12,18 +12,19 @@ import signal
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from loguru import logger
-from bots.bot01_news_sentiment   import NewsSentimentBot
-from bots.bot02_options_flow     import OptionsFlowBot
-from bots.bot03_momentum_scanner import MomentumScanner
-from bots.bot04_data_agent       import DataAgent
-from bots.bot05_strategy_agent   import StrategyAgent
-from bots.bot06_risk_agent       import RiskAgent
-from bots.bot07_execution_agent  import ExecutionAgent
-from bots.bot08_master_commander import MasterCommander
-from bots.bot09_alert_bot        import AlertBot
-from bots.bot10_backtesting_bot  import BacktestingBot
-from bots.bot11_strategy_builder import StrategyBuilder
-from bots.bot12_research_bot     import ResearchBot
+from bots.bot01_news_sentiment    import NewsSentimentBot
+from bots.bot02_options_flow      import OptionsFlowBot
+from bots.bot03_momentum_scanner  import MomentumScanner
+from bots.bot04_data_agent        import DataAgent
+from bots.bot05_strategy_agent    import StrategyAgent
+from bots.bot06_risk_agent        import RiskAgent
+from bots.bot07_execution_agent   import ExecutionAgent
+from bots.bot08_master_commander  import MasterCommander
+from bots.bot09_alert_bot         import AlertBot
+from bots.bot10_backtesting_bot   import BacktestingBot
+from bots.bot11_strategy_builder  import StrategyBuilder
+from bots.bot12_research_bot      import ResearchBot
+from bots.bot13_telegram_controller import TelegramController
 
 
 BOTS = [
@@ -39,6 +40,7 @@ BOTS = [
     BacktestingBot,      # Bot 10
     StrategyBuilder,     # Bot 11
     ResearchBot,         # Bot 12
+    TelegramController,  # Bot 13 – operator control via Telegram
 ]
 
 
@@ -51,7 +53,7 @@ async def main():
     logger.add("logs/system.log", rotation="100 MB", retention="7 days")
 
     logger.info("=" * 60)
-    logger.info("  AI Trading Bot System – 12 Bots")
+    logger.info("  AI Trading Bot System – 13 Bots")
     logger.info("  Paper trading: Alpaca")
     logger.info("=" * 60)
 

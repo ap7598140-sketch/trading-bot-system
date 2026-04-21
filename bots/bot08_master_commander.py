@@ -120,6 +120,7 @@ class MasterCommander(BaseBot):
         await self.bus.subscribe(RedisConfig.CHANNEL_HEARTBEAT, self._on_heartbeat)
         await self.bus.subscribe(RedisConfig.CHANNEL_RISK,      self._on_risk_update)
         await self.bus.subscribe(RedisConfig.CHANNEL_ALERTS,    self._on_alert)
+        await self.bus.subscribe(RedisConfig.CHANNEL_CONTROL,   self._on_control_command)
         asyncio.create_task(self.bus.listen())
         asyncio.create_task(self._eod_close_task())
         asyncio.create_task(self._backup_close_task())
@@ -192,6 +193,43 @@ class MasterCommander(BaseBot):
         elif alert_type == "take_profit":
             self._wins_today += 1
             self._consecutive_losses = 0  # reset streak on a winner
+
+    async def _on_control_command(self, data: dict):
+        """Handle commands published by Bot 13 (Telegram Controller) via CHANNEL_CONTROL."""
+        cmd    = data.get("type", "")
+        source = data.get("source", "unknown")
+        reason = data.get("reason", cmd)
+        self.log(f"Control command from {source}: {cmd} — {reason}")
+
+        if cmd == "halt_trading":
+            self._system_halted  = True
+            self._halt_published = True
+            await self._emergency_halt(reason)
+
+        elif cmd == "halt_new_trades":
+            await self._publish_halt_new_trades(reason)
+
+        elif cmd == "resume_trading":
+            self._system_halted  = False
+            self._halt_published = False
+            await self.save_state("market_gate", {
+                "allow_new_trades": True,
+                "reason":           "operator_resume",
+                "timestamp":        datetime.utcnow().isoformat(),
+            }, ttl=86400)
+            await self.publish(RedisConfig.CHANNEL_ORDERS, {
+                "type":   "resume_trading",
+                "reason": reason,
+            })
+            self.log("Trading resumed by operator command")
+
+        elif cmd == "close_all":
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, self.alpaca.close_all_positions)
+                self.log("Operator close_all: all positions closed")
+            except Exception as e:
+                self.log(f"Operator close_all error: {e}", "error")
 
     # ── Regime detection ──────────────────────────────────────────────────────
 
