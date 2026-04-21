@@ -5,6 +5,10 @@ Role   : Monitors unusual options activity via Alpaca's options data feed.
          Detects large call/put sweeps, unusual open interest changes, and
          skew shifts that signal smart-money positioning.
          Publishes options flow signals to CHANNEL_OPTIONS_FLOW.
+
+NOTE: Alpaca paper trading does not support the options data API.
+      When PAPER=true this bot logs a one-time warning and sits idle;
+      it never blocks trading — bot05 trades on momentum + news alone.
 """
 
 import asyncio
@@ -38,6 +42,7 @@ class OptionsFlowBot(BaseBot):
         self.client = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
         self._prev_oi: dict[str, dict] = {}    # symbol -> {strike: oi}
         self._market_context: dict = {}
+        self._options_disabled = False         # set True when paper-trading limitation detected
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -45,9 +50,25 @@ class OptionsFlowBot(BaseBot):
         # Subscribe to market data for price context
         await self.bus.subscribe(RedisConfig.CHANNEL_MARKET_DATA, self._on_market_data)
         asyncio.create_task(self.bus.listen())
-        self.log("Options Flow Bot starting")
+
+        if AlpacaConfig.PAPER:
+            self._options_disabled = True
+            self.log(
+                "Paper trading mode detected — Alpaca options API is not available on "
+                "paper accounts. Options signals disabled. Bot 5 will trade using "
+                "momentum + news signals only. No action required.",
+                "warning",
+            )
+        else:
+            self.log("Options Flow Bot starting (live mode)")
 
     async def run(self):
+        if self._options_disabled:
+            # Stay alive for heartbeats; never poll the API
+            while self.running:
+                await asyncio.sleep(3600)
+            return
+
         while self.running:
             try:
                 await self._options_cycle()
@@ -88,7 +109,20 @@ class OptionsFlowBot(BaseBot):
                     data = await resp.json()
                     return self._parse_snapshots(data.get("snapshots", {}))
                 elif resp.status == 404:
-                    return []   # Options not available for this symbol
+                    return []   # options not listed for this symbol
+                elif resp.status in (400, 403, 422):
+                    # Paper trading accounts receive 400 from the options endpoint.
+                    # Disable permanently so logs stay clean.
+                    if not self._options_disabled:
+                        self._options_disabled = True
+                        self.log(
+                            f"Options API returned {resp.status} for {symbol} — "
+                            "this account does not have options data access (paper trading). "
+                            "Options signals permanently disabled; trading continues on "
+                            "momentum + news signals.",
+                            "warning",
+                        )
+                    return []
                 else:
                     self.log(f"Options fetch {symbol} status {resp.status}", "warning")
                     return []

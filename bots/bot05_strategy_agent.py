@@ -99,16 +99,42 @@ class StrategyAgent(BaseBot):
             self._news_signals.append(data)
             if len(self._news_signals) > 50:
                 self._news_signals = self._news_signals[-50:]
+            self.log(
+                f"News signal received: {data.get('symbols')} "
+                f"{data.get('sentiment')} score={data.get('score')} "
+                f"[{data.get('catalyst') or data.get('title','')[:50]}] "
+                f"| buffer={len(self._news_signals)}"
+            )
 
     async def _on_momentum(self, data: dict):
         self._momentum_signals.append(data)
         if len(self._momentum_signals) > 100:
             self._momentum_signals = self._momentum_signals[-100:]
+        self.log(
+            f"Momentum signal received: {data.get('symbol')} "
+            f"{data.get('direction')} score={data.get('score')} "
+            f"grade={data.get('grade')} | buffer={len(self._momentum_signals)}"
+        )
+        # Trigger a decision cycle immediately when fresh momentum arrives —
+        # don't wait for the next market-data event (which may already have fired)
+        now = datetime.now(timezone.utc)
+        if (self._last_decision is None or
+                (now - self._last_decision).total_seconds() >= DECISION_DEBOUNCE):
+            self._last_decision = now
+            try:
+                await self._decision_cycle()
+            except Exception as e:
+                self.log(f"Decision cycle error (momentum trigger): {e}", "error")
 
     async def _on_options(self, data: dict):
         self._options_signals.append(data)
         if len(self._options_signals) > 30:
             self._options_signals = self._options_signals[-30:]
+        self.log(
+            f"Options signal received: {data.get('symbol')} "
+            f"{data.get('bias')} conf={data.get('confidence')} "
+            f"| buffer={len(self._options_signals)}"
+        )
 
     # ── Morning sector strength check ─────────────────────────────────────────
 
@@ -390,9 +416,17 @@ class StrategyAgent(BaseBot):
 
         signals = self._aggregate_signals()
 
-        # Skip only if ALL signal types are empty (1-signal threshold)
+        self.log(
+            f"Decision cycle | momentum={len(self._momentum_signals)} "
+            f"news={len(self._news_signals)} options={len(self._options_signals)}"
+        )
+
+        # Require at least one signal type — momentum alone is sufficient to trade
         if not signals["momentum"] and not signals["options"] and not signals["news"]:
-            self.log("Insufficient signals, skipping cycle")
+            self.log(
+                "No signals available yet — waiting for momentum/news. "
+                "Will retry when bot03 publishes next scan or market data arrives."
+            )
             return
 
         result = await self._generate_trade_setups(signals)
@@ -433,10 +467,11 @@ class StrategyAgent(BaseBot):
             "timestamp":     datetime.utcnow().isoformat(),
         }, ttl=120)
 
-        # Reset signal buffers
-        self._news_signals     = []
-        self._momentum_signals = []
-        self._options_signals  = []
+        # Keep the last 5 of each buffer as carry-forward so signals that arrived
+        # during this cycle aren't silently dropped before the next run
+        self._news_signals     = self._news_signals[-5:]
+        self._momentum_signals = self._momentum_signals[-5:]
+        self._options_signals  = self._options_signals[-5:]
 
         self.log(f"Cycle complete | {len(setups)} setups | bias={market_bias}")
 

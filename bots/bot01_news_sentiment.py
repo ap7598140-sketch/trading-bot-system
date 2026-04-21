@@ -21,7 +21,7 @@ from shared.base_bot import BaseBot
 from shared.llm_router import LLMRouter
 
 
-POLL_INTERVAL = 1200  # seconds between news fetches (20 min)
+POLL_INTERVAL = 300   # seconds between news fetches (5 min)
 MARKET_TZ     = pytz.timezone("America/New_York")
 
 
@@ -94,6 +94,8 @@ class NewsSentimentBot(BaseBot):
         articles = await self._fetch_alpaca_news(symbols, hours=12)
         if not articles and self.news_api:
             articles = await self._fetch_newsapi(symbols, hours=12)
+        if not articles:
+            articles = await self._fetch_yahoo_rss()
 
         if not articles:
             self.log("Catalyst scan: no articles found")
@@ -207,6 +209,56 @@ class NewsSentimentBot(BaseBot):
                         "_symbols":    item.get("symbols", []),
                     })
                 return articles
+
+    async def _fetch_yahoo_rss(self) -> list[dict]:
+        """
+        Fetch top financial headlines from Yahoo Finance RSS feeds.
+        No API key required. Used as final fallback when Alpaca/NewsAPI fail.
+        Returns articles in the same normalised shape as other fetch methods.
+        """
+        import xml.etree.ElementTree as ET
+
+        rss_urls = [
+            "https://finance.yahoo.com/rss/topstories",
+            "https://finance.yahoo.com/news/rssindex",
+        ]
+        articles: list[dict] = []
+        seen_titles: set[str] = set()
+
+        async with aiohttp.ClientSession() as session:
+            for url in rss_urls:
+                try:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; tradingbot/1.0)"},
+                    ) as resp:
+                        if resp.status != 200:
+                            self.log(f"Yahoo RSS {url} status {resp.status}", "warning")
+                            continue
+                        text = await resp.text()
+                        root = ET.fromstring(text)
+                        for item in root.findall(".//item"):
+                            title   = (item.findtext("title") or "").strip()
+                            link    = (item.findtext("link") or "").strip()
+                            pubdate = (item.findtext("pubDate") or "").strip()
+                            if not title or title in seen_titles:
+                                continue
+                            seen_titles.add(title)
+                            uid = f"yahoo_{abs(hash(title)) % 10 ** 9}"
+                            articles.append({
+                                "title":       title,
+                                "url":         link,
+                                "publishedAt": pubdate,
+                                "_id":         uid,
+                                "_symbols":    [],   # LLM identifies tickers from headline
+                            })
+                except Exception as e:
+                    self.log(f"Yahoo RSS error ({url}): {e}", "warning")
+
+        if articles:
+            self.log(f"Yahoo RSS: fetched {len(articles)} headlines")
+        return articles
 
     # ── Sentiment scoring ──────────────────────────────────────────────────────
 
@@ -327,10 +379,19 @@ class NewsSentimentBot(BaseBot):
     async def _news_cycle(self):
         symbols = list(dict.fromkeys(UniverseConfig.WATCHLIST))
 
-        # Try Alpaca news first (no extra key needed), fallback to NewsAPI
+        # 1. Alpaca news (no extra key needed)
         articles = await self._fetch_alpaca_news(symbols, hours=4)
+        source = "alpaca"
+        # 2. NewsAPI fallback
         if not articles and self.news_api:
             articles = await self._fetch_newsapi(symbols, hours=4)
+            source = "newsapi"
+        # 3. Yahoo Finance RSS — always available, no key required
+        if not articles:
+            articles = await self._fetch_yahoo_rss()
+            source = "yahoo_rss"
+
+        self.log(f"News fetch: {len(articles)} articles from {source}")
 
         # Deduplicate
         new_articles = []
@@ -344,7 +405,7 @@ class NewsSentimentBot(BaseBot):
             self._seen_ids = set(list(self._seen_ids)[-1000:])
 
         if not new_articles:
-            self.log("No new articles")
+            self.log("No new articles after dedup")
             return
 
         scored = await self._score_articles(new_articles)
