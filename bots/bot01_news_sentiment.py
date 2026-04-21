@@ -263,13 +263,19 @@ class NewsSentimentBot(BaseBot):
     # ── Sentiment scoring ──────────────────────────────────────────────────────
 
     async def _score_articles(self, articles: list[dict]) -> list[dict]:
-        """Score a batch of headlines with Haiku in a single API call."""
+        """Score a batch of headlines with Haiku; keyword fallback if LLM unavailable."""
         if not articles:
             return []
 
-        # Titles only (no 300-char summaries), cap at 15 — saves ~70% tokens
-        items = [{"id": i, "t": a.get("title", "")[:80]}
-                 for i, a in enumerate(articles[:15])]
+        batch = articles[:15]
+        titles = [a.get("title", "")[:80] for a in batch]
+        self.log(
+            f"Scoring {len(batch)} articles via LLM | "
+            + " | ".join(f'"{t[:50]}"' for t in titles[:3])
+            + ("..." if len(batch) > 3 else "")
+        )
+
+        items = [{"id": i, "t": t} for i, t in enumerate(titles)]
         ck = LLMRouter.cache_key(items)
         prompt = (
             "Sentiment score each headline. Tickers affected.\n"
@@ -278,69 +284,125 @@ class NewsSentimentBot(BaseBot):
             "\"score\":0.85,\"symbols\":[],\"catalyst\":\"\"}]}"
         )
 
-        try:
-            raw = await self._router.call(
-                [{"role": "user", "content": prompt}],
-                prefer="haiku", max_tokens=800, cache_key=ck,
+        raw = await self._router.call(
+            [{"role": "user", "content": prompt}],
+            prefer="haiku", max_tokens=800, cache_key=ck,
+        )
+
+        if not raw:
+            self.log(
+                "LLM returned empty response (API error or key missing) — "
+                "falling back to keyword scoring",
+                "warning",
             )
+            return self._keyword_score_articles(batch)
 
-            # ── Robust JSON cleaning ────────────────────────────────────────
-            # 1. Strip all markdown code fences
-            raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
-            # 2. Remove // line comments and /* block comments */
-            raw = re.sub(r"//[^\n]*", "", raw)
-            raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
-            # 3. Fix Python/JS literals
-            raw = raw.replace("None", "null").replace("True", "true").replace("False", "false")
-            # 4. Remove trailing commas (two passes for nested structures)
-            raw = re.sub(r",\s*([}\]])", r"\1", raw)
-            raw = re.sub(r",\s*([}\]])", r"\1", raw)
-            # 5. Bracket-tracking extraction of first complete {...} or [...]
-            raw = self._extract_json_block(raw)
+        # ── Robust JSON cleaning ────────────────────────────────────────────
+        cleaned = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
+        cleaned = re.sub(r"//[^\n]*", "", cleaned)
+        cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+        cleaned = cleaned.replace("None", "null").replace("True", "true").replace("False", "false")
+        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        cleaned = self._extract_json_block(cleaned)
 
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                return []   # truncated or malformed — silent, caller gets []
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            self.log(
+                f"JSON parse failed ({e}) — raw response was: {raw[:200]!r} — "
+                "falling back to keyword scoring",
+                "warning",
+            )
+            return self._keyword_score_articles(batch)
 
-            # Normalise: AI sometimes returns bare list instead of {"results":[...]}
-            if isinstance(parsed, list):
-                parsed = {"results": parsed}
-            if not isinstance(parsed, dict):
-                return []
+        if isinstance(parsed, list):
+            parsed = {"results": parsed}
+        if not isinstance(parsed, dict):
+            self.log(f"Unexpected LLM response type {type(parsed)} — keyword fallback", "warning")
+            return self._keyword_score_articles(batch)
 
-            raw_results = parsed.get("results", [])
-            if not isinstance(raw_results, list):
-                return []
+        raw_results = parsed.get("results", [])
+        if not isinstance(raw_results, list):
+            return self._keyword_score_articles(batch)
 
-            # Build id→result map, guarding against non-dict items
-            results = {
-                r["id"]: r
-                for r in raw_results
-                if isinstance(r, dict) and "id" in r
-            }
+        results = {
+            r["id"]: r
+            for r in raw_results
+            if isinstance(r, dict) and "id" in r
+        }
 
-            scored = []
-            for i, article in enumerate(articles):
-                if not isinstance(article, dict):
-                    continue
-                r = results.get(i, {})
-                if not isinstance(r, dict):
-                    r = {}
-                scored.append({
-                    "title":     article.get("title", ""),
-                    "url":       article.get("url", ""),
-                    "published": article.get("publishedAt", ""),
-                    "sentiment": r.get("sentiment", "neutral"),
-                    "score":     r.get("score", 0.5),
-                    "symbols":   r.get("symbols", article.get("_symbols", [])),
-                    "catalyst":  r.get("catalyst", ""),
-                })
-            return scored
+        scored = []
+        for i, article in enumerate(batch):
+            if not isinstance(article, dict):
+                continue
+            r = results.get(i, {})
+            if not isinstance(r, dict):
+                r = {}
+            sentiment = r.get("sentiment", "neutral")
+            # If LLM left this article unscored, apply keyword fallback for it
+            if not r:
+                kw = self._keyword_score_one(article.get("title", ""))
+                sentiment = kw["sentiment"]
+            scored.append({
+                "title":     article.get("title", ""),
+                "url":       article.get("url", ""),
+                "published": article.get("publishedAt", ""),
+                "sentiment": sentiment,
+                "score":     r.get("score", 0.6),
+                "symbols":   r.get("symbols", article.get("_symbols", [])),
+                "catalyst":  r.get("catalyst", ""),
+            })
 
-        except Exception as e:
-            self.log(f"Sentiment scoring error: {e}", "warning")
-            return []
+        non_neutral = sum(1 for s in scored if s["sentiment"] != "neutral")
+        self.log(f"Scored {len(scored)} articles | non-neutral={non_neutral}")
+        return scored
+
+    # ── Keyword-based fallback scorer ─────────────────────────────────────────
+
+    _BULLISH_WORDS = {
+        "surge", "rally", "soar", "jump", "beat", "upgrade", "buy",
+        "record", "profit", "gain", "rise", "high", "boom", "strong",
+        "growth", "positive", "outperform", "bullish", "optimistic",
+    }
+    _BEARISH_WORDS = {
+        "drop", "fall", "crash", "miss", "downgrade", "sell", "loss",
+        "decline", "plunge", "weak", "low", "risk", "concern", "bearish",
+        "cut", "layoff", "bankrupt", "recession", "warning", "fears",
+    }
+
+    def _keyword_score_one(self, title: str) -> dict:
+        words = set(re.findall(r"\b\w+\b", title.lower()))
+        bull  = len(words & self._BULLISH_WORDS)
+        bear  = len(words & self._BEARISH_WORDS)
+        if bull > bear:
+            return {"sentiment": "bullish", "score": 0.65}
+        if bear > bull:
+            return {"sentiment": "bearish", "score": 0.65}
+        return {"sentiment": "neutral", "score": 0.5}
+
+    def _keyword_score_articles(self, articles: list[dict]) -> list[dict]:
+        """Score articles by financial keyword matching — no LLM required."""
+        watchlist_set = set(sym.upper() for sym in UniverseConfig.WATCHLIST)
+        scored = []
+        for article in articles:
+            title  = article.get("title", "")
+            kw     = self._keyword_score_one(title)
+            # Extract any watchlist symbols mentioned in the title
+            words  = set(re.findall(r"\b[A-Z]{1,5}\b", title))
+            syms   = list(words & watchlist_set)
+            scored.append({
+                "title":     title,
+                "url":       article.get("url", ""),
+                "published": article.get("publishedAt", ""),
+                "sentiment": kw["sentiment"],
+                "score":     kw["score"],
+                "symbols":   syms or article.get("_symbols", []),
+                "catalyst":  "",
+            })
+        non_neutral = sum(1 for s in scored if s["sentiment"] != "neutral")
+        self.log(f"Keyword scored {len(scored)} articles | non-neutral={non_neutral}")
+        return scored
 
     @staticmethod
     def _extract_json_block(text: str) -> str:

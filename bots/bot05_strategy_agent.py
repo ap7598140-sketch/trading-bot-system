@@ -68,7 +68,13 @@ class StrategyAgent(BaseBot):
         asyncio.create_task(self.bus.listen())
         asyncio.create_task(self._morning_sector_task())
         await self._refresh_portfolio()
-        self.log(f"Strategy Agent starting | portfolio=${self._portfolio_value:,.2f}")
+        self.log(
+            f"Strategy Agent starting | portfolio=${self._portfolio_value:,.2f} | "
+            f"subscribed to: market_data='{RedisConfig.CHANNEL_MARKET_DATA}' "
+            f"news='{RedisConfig.CHANNEL_NEWS}' "
+            f"momentum='{RedisConfig.CHANNEL_MOMENTUM}' "
+            f"options='{RedisConfig.CHANNEL_OPTIONS_FLOW}'"
+        )
 
     async def run(self):
         # Keep alive; decisions fire event-driven from _on_market_data

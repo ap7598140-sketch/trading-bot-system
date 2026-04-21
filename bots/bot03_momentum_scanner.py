@@ -54,7 +54,11 @@ class MomentumScanner(BaseBot):
         await self.bus.subscribe(RedisConfig.CHANNEL_MARKET_DATA, self._on_market_data)
         asyncio.create_task(self.bus.listen())
         asyncio.create_task(self._morning_watchlist_task())
-        self.log("Momentum Scanner starting")
+        self.log(
+            f"Momentum Scanner starting | "
+            f"listens on '{RedisConfig.CHANNEL_MARKET_DATA}' | "
+            f"publishes to '{RedisConfig.CHANNEL_MOMENTUM}'"
+        )
 
     async def run(self):
         # Run scan on interval
@@ -346,12 +350,20 @@ class MomentumScanner(BaseBot):
 
         # Publish each signal
         published = 0
+        self.log(
+            f"Publishing {len(top_signals)} signals to channel '{RedisConfig.CHANNEL_MOMENTUM}'"
+        )
         for sig in top_signals:
             sig["narrative"] = narratives.get(sig["symbol"], "")
             await self.publish(RedisConfig.CHANNEL_MOMENTUM, {
                 "type": "momentum_signal",
                 **sig,
             })
+            self.log(
+                f"  → published: {sig['symbol']} {sig['direction']} "
+                f"score={sig['score']} grade={sig['grade']} "
+                f"channel='{RedisConfig.CHANNEL_MOMENTUM}'"
+            )
             published += 1
 
         # Leaderboard state for Master Commander
@@ -366,7 +378,8 @@ class MomentumScanner(BaseBot):
         }
         await self.save_state("leaderboard", leaderboard, ttl=120)
         self.log(
-            f"Scan complete | watchlist={len(scan_universe)}/{len(self._latest)} symbols | "
+            f"Scan complete | channel='{RedisConfig.CHANNEL_MOMENTUM}' | "
+            f"watchlist={len(scan_universe)}/{len(self._latest)} symbols | "
             f"{len(bullish)} bullish | {len(bearish)} bearish | published {published}"
         )
 
