@@ -11,15 +11,15 @@ Role   : Order router and trade executor.
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from typing import Optional
 
-
+import httpx
 import pytz
 
 import anthropic
 
-from config import Models, RedisConfig, AnthropicConfig, RiskConfig
+from config import Models, RedisConfig, AnthropicConfig, RiskConfig, TradingWindowConfig, AlertConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 
@@ -45,6 +45,10 @@ class ExecutionAgent(BaseBot):
         self._trades_today  = 0       # resets at market open; capped at MAX_DAILY_TRADES
         self._pending_orders: dict[str, dict] = {}    # order_id → order info
         self._executions_today: list[dict] = []
+        # Position tracker for partial-close / trailing-stop / compound logic
+        # key = symbol, value = {shares, entry_price, size_usd, grade,
+        #                        partial_closed, trailing_set, compounded}
+        self._position_tracker: dict[str, dict] = {}
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -52,6 +56,7 @@ class ExecutionAgent(BaseBot):
         await self.bus.subscribe(RedisConfig.CHANNEL_ORDERS, self._on_order_event)
         asyncio.create_task(self.bus.listen())
         asyncio.create_task(self._order_monitor())
+        asyncio.create_task(self._position_monitor())
         asyncio.create_task(self._eod_cancel_task())
         asyncio.create_task(self._eod_no_buys_task())
         self.log("Execution Agent starting")
@@ -129,6 +134,22 @@ class ExecutionAgent(BaseBot):
             return
 
         side = "buy" if direction == "long" else "sell"
+
+        # Only open new buy positions during allowed entry windows
+        if side == "buy":
+            t  = datetime.now(MARKET_TZ).time()
+            mo = dt_time(*TradingWindowConfig.MORNING_OPEN)
+            mc = dt_time(*TradingWindowConfig.MORNING_CLOSE)
+            ao = dt_time(*TradingWindowConfig.AFTERNOON_OPEN)
+            ac = dt_time(*TradingWindowConfig.AFTERNOON_CLOSE)
+            in_window = (mo <= t <= mc) or (ao <= t <= ac)
+            if not in_window:
+                self.log(
+                    f"SKIPPED {sym}: outside entry windows ({t.strftime('%H:%M')} ET) — "
+                    f"windows: 9:45-10:30am, 2:00-3:00pm",
+                    "warning",
+                )
+                return
 
         # After 3:50pm block new buy orders (EOD wind-down)
         if self._no_new_buys and side == "buy":
@@ -258,10 +279,27 @@ class ExecutionAgent(BaseBot):
             if result.get("id"):
                 self._pending_orders[result["id"]] = execution_record
 
+            # Record in position tracker for partial close / compound monitoring
+            if side == "buy":
+                self._position_tracker[sym] = {
+                    "shares":         shares,
+                    "entry_price":    entry,
+                    "size_usd":       size_usd,
+                    "grade":          setup.get("grade", ""),
+                    "stop_loss":      setup.get("stop_loss", 0),
+                    "take_profit":    setup.get("take_profit", 0),
+                    "partial_closed": False,
+                    "trailing_set":   False,
+                    "compounded":     False,
+                    "timestamp":      datetime.utcnow().isoformat(),
+                }
+
             await self.publish(RedisConfig.CHANNEL_ALERTS, {
                 "type":      "order_submitted",
                 **execution_record,
             })
+
+            await self._send_trade_alert(setup, "ENTRY", shares, entry)
 
             self.log(
                 f"Order submitted: {result.get('id')} | status={result.get('status')} | "
@@ -275,6 +313,181 @@ class ExecutionAgent(BaseBot):
                 "symbol": sym,
                 "error":  str(e),
             })
+
+    # ── Telegram sender ────────────────────────────────────────────────────────
+
+    async def _send_telegram(self, text: str):
+        token   = AlertConfig.TELEGRAM_BOT_TOKEN
+        chat_id = AlertConfig.TELEGRAM_CHAT_ID
+        if not token or not chat_id:
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={
+                    "chat_id":    chat_id,
+                    "text":       text,
+                    "parse_mode": "HTML",
+                })
+        except Exception as e:
+            self.log(f"Telegram error: {e}", "warning")
+
+    async def _send_trade_alert(self, setup: dict, action: str,
+                                 shares: int, price: float):
+        """Send a rich Telegram trade alert for every entry/exit."""
+        sym       = setup.get("symbol", "?")
+        direction = (setup.get("direction") or "long").upper()
+        sl        = setup.get("stop_loss", 0)
+        tp        = setup.get("take_profit", 0)
+        conf      = setup.get("confidence", 0)
+        grade     = setup.get("grade", "")
+        catalyst  = (setup.get("catalyst") or setup.get("thesis") or "")[:60]
+        size_usd  = setup.get("position_size_usd", 0)
+
+        sl_usd  = round(abs(price - sl)  * shares, 2) if sl  else 0
+        tp_usd  = round(abs(tp   - price) * shares, 2) if tp else 0
+
+        if action == "ENTRY":
+            icon = "🟢" if direction == "LONG" else "🔴"
+            lines = [
+                f"{icon} <b>TRADE ENTRY — {sym}</b>",
+                f"Direction:  {direction} | Grade: {grade or 'N/A'}",
+                f"Entry:      ${price:.2f} × {shares} shares (${size_usd:,.0f})",
+                f"Stop loss:  ${sl:.2f}  (risk -${sl_usd:.0f})",
+                f"Target:     ${tp:.2f}  (profit +${tp_usd:.0f})",
+                f"Confidence: {conf:.0%}",
+                f"Reason:     {catalyst}",
+            ]
+        elif action == "PARTIAL_CLOSE":
+            lines = [
+                f"💰 <b>PARTIAL CLOSE — {sym}</b>",
+                f"Sold {shares} shares at ${price:.2f} (+2% target hit)",
+                f"Trailing stop now active on remaining shares",
+            ]
+        elif action == "COMPOUND":
+            lines = [
+                f"🚀 <b>COMPOUNDING — {sym}</b>",
+                f"Added {shares} more shares at ${price:.2f} (+$50 profit threshold hit)",
+                f"Letting winner run to $100+",
+            ]
+        else:
+            lines = [f"📋 <b>{action} — {sym}</b>", f"{shares} shares @ ${price:.2f}"]
+
+        try:
+            await self._send_telegram("\n".join(lines))
+        except Exception as e:
+            self.log(f"Trade alert error: {e}", "warning")
+
+    # ── Position monitor (partial close / trailing stop / compound) ────────────
+
+    async def _position_monitor(self):
+        """
+        Polls open positions every 30 s and applies trade management rules:
+          +2%  of entry → partial close 50% of shares, submit trailing stop
+          +$40 profit   → ensure trailing stop is active (implicit via +2% rule)
+          +$50 profit   → compound: add 50% more shares (once per position)
+        """
+        while self.running:
+            await asyncio.sleep(30)
+            if not self._position_tracker or self._trading_halted:
+                continue
+            try:
+                loop      = asyncio.get_event_loop()
+                positions = await loop.run_in_executor(None, self.alpaca.get_positions)
+                live_map  = {p["symbol"]: p for p in positions}
+
+                for sym, tracker in list(self._position_tracker.items()):
+                    live = live_map.get(sym)
+                    if not live:
+                        # Position gone (closed externally) — clean up tracker
+                        self._position_tracker.pop(sym, None)
+                        continue
+
+                    entry       = tracker["entry_price"]
+                    orig_shares = tracker["shares"]
+                    unreal_pl   = float(live.get("unrealized_pl", 0))
+                    cur_price   = float(live.get("current_price", entry))
+                    cur_qty     = float(live.get("qty", orig_shares))
+
+                    # ── Partial close at +2% ───────────────────────────────────
+                    partial_trigger_usd = entry * orig_shares * RiskConfig.PARTIAL_CLOSE_TRIGGER_PCT
+                    if (not tracker["partial_closed"]
+                            and unreal_pl >= partial_trigger_usd
+                            and cur_qty >= 2):
+                        close_qty = max(1, int(cur_qty * RiskConfig.PARTIAL_CLOSE_PCT))
+                        remain    = int(cur_qty - close_qty)
+                        self.log(
+                            f"PARTIAL CLOSE {sym}: up ${unreal_pl:.2f} (+2%) — "
+                            f"selling {close_qty} of {int(cur_qty)} shares"
+                        )
+                        try:
+                            await loop.run_in_executor(
+                                None,
+                                lambda s=sym, q=close_qty: self.alpaca.close_partial_position(s, q),
+                            )
+                            tracker["partial_closed"] = True
+
+                            # Submit trailing stop on remaining shares
+                            if remain >= 1 and not tracker["trailing_set"]:
+                                await loop.run_in_executor(
+                                    None,
+                                    lambda s=sym, r=remain: self.alpaca.submit_trailing_stop_order(
+                                        s, r, "sell", RiskConfig.TRAILING_STOP_USD
+                                    ),
+                                )
+                                tracker["trailing_set"] = True
+                                self.log(
+                                    f"Trailing stop set on {sym}: {remain} shares, "
+                                    f"trail=${RiskConfig.TRAILING_STOP_USD}"
+                                )
+
+                            fake_setup = {
+                                "symbol": sym, "direction": "long",
+                                "stop_loss": tracker.get("stop_loss", 0),
+                                "take_profit": tracker.get("take_profit", 0),
+                                "confidence": 1.0, "grade": tracker.get("grade", ""),
+                                "catalyst": "partial_close_2pct",
+                                "position_size_usd": tracker.get("size_usd", 0),
+                            }
+                            await self._send_trade_alert(fake_setup, "PARTIAL_CLOSE",
+                                                          close_qty, cur_price)
+                        except Exception as e:
+                            self.log(f"Partial close failed {sym}: {e}", "error")
+
+                    # ── Compound at +$50 ──────────────────────────────────────
+                    if (not tracker["compounded"]
+                            and unreal_pl >= RiskConfig.COMPOUND_TRIGGER_PROFIT_USD
+                            and not self._no_new_buys
+                            and not self._trading_halted):
+                        add_shares = max(1, int(orig_shares * 0.50))
+                        self.log(
+                            f"COMPOUND {sym}: up ${unreal_pl:.2f} — "
+                            f"adding {add_shares} more shares at ${cur_price:.2f}"
+                        )
+                        try:
+                            live_price = await self._fetch_live_price(sym, "buy")
+                            if live_price:
+                                await loop.run_in_executor(
+                                    None,
+                                    lambda s=sym, q=add_shares: self.alpaca.submit_market_order(
+                                        s, q, "buy"
+                                    ),
+                                )
+                                tracker["compounded"] = True
+                                fake_setup = {
+                                    "symbol": sym, "direction": "long",
+                                    "stop_loss": 0, "take_profit": 0,
+                                    "confidence": 1.0, "grade": tracker.get("grade", ""),
+                                    "catalyst": "compound_50_profit",
+                                    "position_size_usd": tracker.get("size_usd", 0),
+                                }
+                                await self._send_trade_alert(fake_setup, "COMPOUND",
+                                                              add_shares, live_price or cur_price)
+                        except Exception as e:
+                            self.log(f"Compound add failed {sym}: {e}", "error")
+
+            except Exception as e:
+                self.log(f"Position monitor error: {e}", "warning")
 
     # ── Live price fetcher ─────────────────────────────────────────────────────
 

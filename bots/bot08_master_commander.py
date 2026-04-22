@@ -100,6 +100,7 @@ class MasterCommander(BaseBot):
         self._consecutive_losses  = 0    # incremented on stop_loss_triggered, reset on market open
         self._wins_today          = 0    # positions closed at take-profit
         self._losses_today        = 0    # positions closed at stop-loss
+        self._milestone_sent: set[str] = set()  # tracks which daily milestones have been alerted
 
         # Aggregated signals
         self._risk_stats:      dict = {}
@@ -434,6 +435,48 @@ class MasterCommander(BaseBot):
             return {"trading_allowed": not self._system_halted,
                     "session_action": "continue", "risk_level": "medium", "notes": ""}
 
+    # ── Profit milestones ──────────────────────────────────────────────────────
+
+    async def _check_profit_milestones(self):
+        """
+        Fire one Telegram alert per milestone per day (tracked in _milestone_sent).
+        At $100 profit: halt new trades and lock in the gain.
+        At -$150 loss:  emergency halt.
+        """
+        if self._market_session not in ("open", "closing_soon"):
+            return
+        pnl = self._daily_pnl
+
+        milestones = [
+            ("p25",  25,  False, "💪 <b>+$25 milestone!</b> Good start — stay disciplined."),
+            ("p50",  50,  False, "🎯 <b>+$50 milestone!</b> Halfway to the daily target."),
+            ("p75",  75,  False, "🔥 <b>+$75 milestone!</b> Getting close — protect the gains!"),
+            ("p100", 100, False, "✅ <b>Daily $100 target HIT!</b> Locking in gains — no new trades."),
+            ("n75",  -75, True,  "⚠️ <b>-$75 drawdown warning.</b> Tighten risk — review positions."),
+            ("n150", -150, True, "🛑 <b>-$150 daily loss limit hit.</b> All trading HALTED for today."),
+        ]
+
+        for key, threshold, is_loss, message in milestones:
+            if key in self._milestone_sent:
+                continue
+            triggered = (pnl <= threshold) if is_loss else (pnl >= threshold)
+            if not triggered:
+                continue
+
+            self._milestone_sent.add(key)
+            await self._send_telegram(
+                f"{message}\nP/L: {'+'if pnl>=0 else ''}${pnl:.2f} | "
+                f"Portfolio: ${self._portfolio_value:,.2f}"
+            )
+            self.log(f"Milestone {key}: pnl=${pnl:.2f}")
+
+            if key == "p100":
+                await self._publish_halt_new_trades(
+                    "Daily $100 profit target hit — locking in gains, no new trades"
+                )
+            elif key == "n150":
+                await self._emergency_halt("Daily -$150 loss limit hit — trading halted for today")
+
     # ── Emergency halt ─────────────────────────────────────────────────────────
 
     async def _emergency_halt(self, reason: str):
@@ -539,33 +582,63 @@ class MasterCommander(BaseBot):
         now_et = self._now_et()
 
         if report_type == "morning_watchlist":
-            premarket  = await self.bus.get_state("bot4:premarket_scan") or {}
-            top_picks  = premarket.get("top_picks", [])
-            threshold  = premarket.get("threshold", 70)
-            regime_lbl = f"{self._current_regime.upper()} (scale {self._regime_scale:.0%})"
+            premarket   = await self.bus.get_state("bot4:premarket_scan") or {}
+            daily_wl    = await self.bus.get_state("bot4:daily_watchlist") or {}
+            regime_lbl  = f"{self._current_regime.upper()} (scale {self._regime_scale:.0%})"
+
+            top10       = daily_wl.get("top_10_active", [])
+            sector_ldrs = daily_wl.get("sector_leaders", [])
+            earn_plays  = daily_wl.get("earnings_plays", [])
+            dynamic     = daily_wl.get("dynamic_finds", [])
+            all_26      = daily_wl.get("all_26", [])
+            # Fall back to legacy top_picks if daily watchlist not populated yet
+            if not top10:
+                top_picks = premarket.get("top_picks", [])
+                top10 = [p["symbol"] for p in top_picks[:10]]
+                all_26 = top_picks[:26]
 
             lines = [
                 "📊 <b>8:30am Morning Watchlist</b>",
                 f"<b>{now_et.strftime('%A, %b %d %Y')}</b>",
                 f"Regime: {regime_lbl}",
-                f"Sector leader: {self._strategy_state.get('sector', 'detecting...')}",
                 "",
             ]
-            if top_picks:
-                lines.append(f"<b>Top picks (score ≥ {threshold}/100):</b>")
-                for p in top_picks[:12]:
-                    lines.append(
-                        f"  {p['symbol']}: {p['score']}/100 @ ${p.get('price', '?')}"
-                    )
+
+            if top10:
+                lines.append("<b>Top 10 active trades today:</b>")
+                # Show score+price if all_26 dict list, else just symbol
+                sym_score = {
+                    e["symbol"]: e for e in (all_26 if isinstance(all_26[0], dict)
+                                              else []) if isinstance(e, dict)
+                } if all_26 else {}
+                for sym in top10[:10]:
+                    info = sym_score.get(sym, {})
+                    score = info.get("score", "?")
+                    price = info.get("price", "?")
+                    lines.append(f"  {sym}: score={score}/100 @ ${price}")
                 lines.append("")
-                if self._current_regime in ("bear", "crash"):
-                    lines.append("⚠️ Bear regime — inverse ETFs only (SQQQ/SPXS/SOXS)")
-            else:
+
+            if sector_ldrs:
+                lines.append(f"Sector leaders: {', '.join(sector_ldrs)}")
+            if earn_plays:
+                lines.append(f"Earnings momentum: {', '.join(earn_plays)}")
+            if dynamic:
+                lines.append(f"Dynamic scan finds: {', '.join(dynamic[:5])}")
+
+            if not top10:
                 lines.append(
                     "No stocks qualify today (score < 70).\n"
                     "System will wait for better setups. No forced trades."
                 )
-            lines.append("\nTrading opens at 9:30am EST.")
+            elif self._current_regime in ("bear", "crash"):
+                lines.append("\n⚠️ Bear regime — inverse ETFs only (SQQQ/SPXS/SOXS)")
+
+            lines += [
+                "",
+                f"🎯 Target: $100 profit today",
+                f"⛔ Daily stop: -$150",
+                "Trading windows: 9:45-10:30am, 2:00-3:00pm EST",
+            ]
             await self._send_telegram("\n".join(lines))
 
         elif report_type == "first_trade_update":
@@ -952,6 +1025,8 @@ class MasterCommander(BaseBot):
                 # Always update session (may have transitioned while market closed)
                 self._market_session = self._get_market_session()
                 await self.save_state("dashboard", self._build_dashboard(), ttl=90)
+                # Check and fire daily P&L milestone alerts
+                await self._check_profit_milestones()
             except Exception as e:
                 self.log(f"Dashboard refresh error: {e}", "warning")
             await asyncio.sleep(60)
@@ -1032,6 +1107,7 @@ class MasterCommander(BaseBot):
                 self._consecutive_losses  = 0
                 self._wins_today          = 0
                 self._losses_today        = 0
+                self._milestone_sent.clear()   # reset daily profit milestones
                 # Ensure gate is open at market open
                 await self.save_state("market_gate", {
                     "allow_new_trades": True,

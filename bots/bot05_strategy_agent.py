@@ -16,7 +16,7 @@ from typing import Optional
 import anthropic
 
 import pytz
-from config import Models, RedisConfig, RiskConfig, AnthropicConfig, UniverseConfig
+from config import Models, RedisConfig, RiskConfig, AnthropicConfig, UniverseConfig, TradingWindowConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 from shared.llm_router import LLMRouter
@@ -59,6 +59,7 @@ class StrategyAgent(BaseBot):
         self._cb_scale: float                = 1.0   # circuit breaker position scale
         self._current_regime: str            = "neutral"  # from bot08 regime state
         self._premarket_scores: dict[str, int] = {}       # symbol → 1-100 score from bot04
+        self._daily_watchlist: list[str]     = []         # top 10 active from bot04 daily scan
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -229,49 +230,96 @@ class StrategyAgent(BaseBot):
 
     def _regime_sl_tp(self) -> tuple[float, float]:
         """Return (stop_loss_pct, take_profit_pct) adjusted for current regime.
-        Euphoria tightens stops to limit to ~$10 max loss per trade."""
+        Euphoria tightens stops so max loss on a $3k position stays around $10."""
         if self._current_regime == "euphoria":
-            return 0.02, 0.04   # $10 max loss on $500 position in hot market
-        return RiskConfig.STOP_LOSS_PCT, RiskConfig.TAKE_PROFIT_PCT  # 6%, 12%
+            return 0.005, 0.01  # very tight — protect gains in overheated market
+        return RiskConfig.STOP_LOSS_PCT, RiskConfig.TAKE_PROFIT_PCT  # 1.5%, 3%
 
-    def _safe_position_size(self, entry, stop_loss) -> float:
+    def _in_trading_window(self) -> bool:
+        """True if current EST time is inside an allowed entry window."""
+        from datetime import time as dt_time
+        t  = datetime.now(MARKET_TZ).time()
+        mo = dt_time(*TradingWindowConfig.MORNING_OPEN)
+        mc = dt_time(*TradingWindowConfig.MORNING_CLOSE)
+        ao = dt_time(*TradingWindowConfig.AFTERNOON_OPEN)
+        ac = dt_time(*TradingWindowConfig.AFTERNOON_CLOSE)
+        return (mo <= t <= mc) or (ao <= t <= ac)
+
+    def _get_symbol_grade(self, sym: str) -> str:
+        """Return the best momentum grade seen for a symbol from recent signals."""
+        order = {"A+": 6, "A": 5, "B": 4, "C": 3, "D": 2, "F": 1}
+        best, best_rank = "", 0
+        for m in self._momentum_signals[-30:]:
+            if m.get("symbol") == sym:
+                g = m.get("grade", "")
+                if order.get(g, 0) > best_rank:
+                    best_rank, best = order.get(g, 0), g
+        return best
+
+    def _grade_position_size(self, grade: str) -> float:
+        """Map momentum grade → base position size in USD."""
+        if grade in ("A", "A+"):
+            return RiskConfig.GRADE_A_POSITION_USD   # $3,000
+        if grade == "B":
+            return RiskConfig.GRADE_B_POSITION_USD   # $2,000
+        return RiskConfig.MIN_SINGLE_POSITION_USD    # $1,500 floor
+
+    def _safe_position_size(self, entry, stop_loss, grade: str = "") -> float:
         """
-        Size by hard dollar risk: max $30 loss per trade, max $500 position.
-        Scaled down by regime × circuit breaker multiplier.
+        Grade-based position sizing scaled by regime × CB multiplier.
+          Grade A  → $3,000 base
+          Grade B  → $2,000 base
+          Default  → $1,500 floor
+        Max loss per trade capped at RiskConfig.MAX_TRADE_LOSS_USD ($75).
         """
-        combined_scale = max(0.0, min(self._regime_scale * self._cb_scale, 1.0))
-        max_position_usd = RiskConfig.MAX_SINGLE_POSITION_USD * combined_scale
-        max_risk_usd     = RiskConfig.MAX_TRADE_LOSS_USD   # hard $30 cap
+        combined_scale   = max(0.0, min(self._regime_scale * self._cb_scale, 1.0))
+        base_usd         = self._grade_position_size(grade)
+        max_position_usd = max(
+            base_usd * combined_scale,
+            RiskConfig.MIN_SINGLE_POSITION_USD * combined_scale,
+        )
+        max_risk_usd = RiskConfig.MAX_TRADE_LOSS_USD   # $75 hard cap
 
         entry     = float(entry or 0)
         stop_loss = float(stop_loss or 0)
 
         if entry <= 0 or stop_loss <= 0:
-            return round(max_risk_usd, 2)
+            return round(max_position_usd, 2)
 
         stop_distance = abs(entry - stop_loss)
         if stop_distance <= 0:
-            return round(max_risk_usd, 2)
+            return round(max_position_usd, 2)
 
-        shares       = int(max_risk_usd / stop_distance)
-        position_usd = min(shares * entry, max_position_usd)
-        return round(position_usd, 2)
+        # Verify the position doesn't risk more than the hard cap
+        implied_shares = int(max_position_usd / entry)
+        if implied_shares > 0 and implied_shares * stop_distance > max_risk_usd:
+            implied_shares = int(max_risk_usd / stop_distance)
+
+        position_usd = min(implied_shares * entry, max_position_usd)
+        return round(max(position_usd, 0), 2)
 
     # ── Premarket scores ───────────────────────────────────────────────────────
 
     async def _load_premarket_scores(self):
-        """Pull bot04's 8am premarket scores into local cache."""
+        """Pull bot04's 8am premarket scores and daily watchlist into local cache."""
         try:
             scan = await self.bus.get_state("bot4:premarket_scan") or {}
             scored = scan.get("scored", [])
             self._premarket_scores = {s["symbol"]: s["score"] for s in scored}
-            if self._premarket_scores:
-                self.log(
-                    f"Premarket scores loaded: {len(self._premarket_scores)} symbols | "
-                    f"top3={sorted(self._premarket_scores, key=self._premarket_scores.get, reverse=True)[:3]}"
-                )
         except Exception as e:
             self.log(f"Premarket score load error: {e}", "warning")
+        try:
+            wl = await self.bus.get_state("bot4:daily_watchlist") or {}
+            top10 = wl.get("top_10_active", [])
+            if top10:
+                self._daily_watchlist = top10
+                self.log(
+                    f"Daily watchlist loaded: {top10} | "
+                    f"sector_leaders={wl.get('sector_leaders', [])} | "
+                    f"earnings={wl.get('earnings_plays', [])}"
+                )
+        except Exception as e:
+            self.log(f"Daily watchlist load error: {e}", "warning")
 
     # ── Winner criteria gate ───────────────────────────────────────────────────
 
@@ -295,6 +343,26 @@ class StrategyAgent(BaseBot):
         criteria_met = 0
         reasons  = []
         failures = []
+
+        # ── Hard gate 1: Grade A or B only (C/D/F = skip) ────────────────────
+        grade = setup.get("grade") or self._get_symbol_grade(sym)
+        if grade and grade not in ("A", "A+", "B", ""):
+            return {
+                "passed": False, "criteria_met": 0, "stock_score": 0,
+                "reasons": [], "failures": [f"grade_{grade}_blocked(need_A_or_B)"],
+            }
+
+        # ── Hard gate 2: Volume must be 2× average ────────────────────────────
+        md  = self._market_data.get(sym, {})
+        ind = md.get("indicators", {}) if md else {}
+        vol_ratio = ind.get("volume_ratio")
+        if vol_ratio is not None and vol_ratio < RiskConfig.VOLUME_CONFIRMATION_X:
+            return {
+                "passed": False, "criteria_met": 0, "stock_score": 0,
+                "reasons": [], "failures": [
+                    f"volume={vol_ratio:.1f}x<{RiskConfig.VOLUME_CONFIRMATION_X:.0f}x_required"
+                ],
+            }
 
         # ── 1. Premarket score ────────────────────────────────────────────────
         stock_score = self._premarket_scores.get(sym, 0)
@@ -495,16 +563,18 @@ class StrategyAgent(BaseBot):
         ck = LLMRouter.cache_key(compressed, int(MAX_POS), sector_tag, self._current_regime)
 
         prompt = (
-            f"Expert trader. Output 1-3 setups. "
-            f"Acct=${PV:.0f} MaxPos=${MAX_POS:.0f} MaxLoss=${RiskConfig.MAX_TRADE_LOSS_USD:.0f} "
-            f"SL={sl_pct*100:.0f}% TP={tp_pct*100:.0f}% conf>={RiskConfig.CONFIDENCE_THRESHOLD}. "
+            f"Expert trader. Output 1-3 setups. ONLY Grade A ($3k) or B ($2k) signals. "
+            f"SL={sl_pct*100:.1f}% TP={tp_pct*100:.1f}% MinRR=2:1 conf>={RiskConfig.CONFIDENCE_THRESHOLD}. "
+            f"GradeA target≥${RiskConfig.MIN_GRADE_A_PROFIT_USD:.0f} "
+            f"GradeB target≥${RiskConfig.MIN_GRADE_B_PROFIT_USD:.0f}. "
             + (f"{sector_tag} " if sector_tag else "")
             + f"{regime_tag}. {bear_note}"
-            f"Each setup MUST include a 'catalyst' field explaining WHY (earnings/upgrade/momentum/rotation).\n"
+            "Each setup MUST include 'catalyst' (earnings/upgrade/momentum/rotation) and 'grade' (A or B).\n"
             f"Signals:{LLMRouter.j(compressed)}\n"
             "JSON:{\"setups\":[{\"symbol\":\"X\",\"direction\":\"long\","
-            "\"entry_price\":0,\"confidence\":0.8,\"timeframe\":\"intraday\","
-            "\"thesis\":\"\",\"catalyst\":\"\",\"required_confirmations\":[]}],"
+            "\"entry_price\":0,\"confidence\":0.8,\"grade\":\"A\","
+            "\"timeframe\":\"intraday\",\"thesis\":\"\",\"catalyst\":\"\","
+            "\"required_confirmations\":[]}],"
             "\"market_bias\":\"neutral\",\"notes\":\"\"}"
         )
 
@@ -543,11 +613,12 @@ class StrategyAgent(BaseBot):
                     s["stop_loss"]   = round(entry * (1 + sl_pct), 4)
                     s["take_profit"] = round(entry * (1 - tp_pct), 4)
 
-                # Recalculate position size using the corrected stop_loss
+                # Recalculate position size using live grade-based sizing
                 ai_size = s.get("position_size_usd", "?")
+                setup_grade = s.get("grade") or self._get_symbol_grade(s.get("symbol", ""))
+                s["grade"]            = setup_grade
                 s["position_size_usd"] = self._safe_position_size(
-                    entry,
-                    s["stop_loss"],
+                    entry, s["stop_loss"], grade=setup_grade
                 )
 
                 # Final guard — never send a setup missing critical fields
@@ -585,27 +656,56 @@ class StrategyAgent(BaseBot):
             self.log("New trades blocked (circuit breaker or market gate). Skipping cycle.", "warning")
             return
 
-        # Daily loss limit: stop trading once $50 is lost today
+        # Time window: only trade 9:45-10:30am and 2:00-3:00pm EST
+        if not self._in_trading_window():
+            from datetime import time as dt_time
+            t = datetime.now(MARKET_TZ).time()
+            self.log(
+                f"Outside trading window ({t.strftime('%H:%M')} ET) — "
+                f"windows: 9:45-10:30am, 2:00-3:00pm. Skipping."
+            )
+            return
+
+        # Daily P&L gates: stop at -$150 loss or +$100 profit
         try:
             dashboard = await self.bus.get_state("bot8:dashboard") or {}
             daily_pnl = float(dashboard.get("daily_pnl", 0))
-            if daily_pnl < -RiskConfig.DAILY_LOSS_LIMIT_USD:
+            if daily_pnl <= -RiskConfig.DAILY_LOSS_LIMIT_USD:
                 self.log(
-                    f"Daily loss limit hit: ${abs(daily_pnl):.2f} > "
-                    f"${RiskConfig.DAILY_LOSS_LIMIT_USD:.0f} — no new trades today",
+                    f"Daily loss limit hit: ${daily_pnl:.2f} — no new trades today",
+                    "warning",
+                )
+                return
+            if daily_pnl >= RiskConfig.DAILY_PROFIT_TARGET_USD:
+                self.log(
+                    f"Daily profit target hit: +${daily_pnl:.2f} — locking in gains, no new trades",
                     "warning",
                 )
                 return
         except Exception:
             pass
 
+        # Filter momentum signals: Grade A/B only, and from daily watchlist if available
+        _ALLOWED_GRADES = {"A", "A+", "B", ""}
+        filtered_momentum = [
+            m for m in self._momentum_signals
+            if (not m.get("grade") or m.get("grade") in _ALLOWED_GRADES)
+            and (not self._daily_watchlist or m.get("symbol") in self._daily_watchlist
+                 or m.get("symbol") in UniverseConfig.BEAR_ETFS)
+        ]
+
         signals = self._aggregate_signals()
+        # Replace momentum with grade/watchlist-filtered version
+        signals["momentum"] = sorted(
+            [s for s in filtered_momentum if s.get("direction") != "neutral"],
+            key=lambda x: x.get("score") or 0.5,
+            reverse=True,
+        )[:10]
 
         self.log(
-            f"Decision cycle | regime={self._current_regime} "
-            f"momentum={len(self._momentum_signals)} "
-            f"news={len(self._news_signals)} options={len(self._options_signals)} "
-            f"premarket_scores={len(self._premarket_scores)}"
+            f"Decision cycle | regime={self._current_regime} | window=OK | "
+            f"momentum={len(filtered_momentum)}/{len(self._momentum_signals)} (A/B grade) | "
+            f"news={len(self._news_signals)} | watchlist={self._daily_watchlist[:5]}"
         )
 
         # Require at least one signal type — momentum alone is sufficient to trade

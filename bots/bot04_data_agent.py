@@ -22,7 +22,7 @@ import pandas as pd
 from alpaca.data.timeframe import TimeFrame
 
 import pytz
-from config import Models, RedisConfig, UniverseConfig, AnthropicConfig, RiskConfig
+from config import Models, RedisConfig, UniverseConfig, AnthropicConfig, RiskConfig, TradingWindowConfig
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 from shared.llm_router import LLMRouter
@@ -327,15 +327,18 @@ class DataAgent(BaseBot):
 
     async def _run_premarket_scan(self):
         """
-        Score every symbol in SCAN_UNIVERSE + BEAR_ETFS.
-        Save scored watchlist to Redis for bot05 and bot08 to consume.
-        Publish top picks to market_data channel.
+        8am pre-market scan:
+          1. Refresh bar cache for full SCAN_UNIVERSE
+          2. Score every symbol 1-100; apply price filter $10-$500
+          3. Build daily 26-stock watchlist (10 core + 10 dynamic + 3 sector + 3 earnings)
+          4. Save premarket_scan + daily_watchlist to Redis
+          5. Publish top picks to market_data channel
         """
         all_syms = list(dict.fromkeys(
             UniverseConfig.SCAN_UNIVERSE + UniverseConfig.BEAR_ETFS
         ))
 
-        # Refresh bar cache for accurate scores
+        # Refresh bar cache
         start = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%d")
         try:
             from alpaca.data.timeframe import TimeFrame
@@ -350,32 +353,44 @@ class DataAgent(BaseBot):
         except Exception as e:
             self.log(f"Premarket scan bar refresh failed (using cached): {e}", "warning")
 
-        # Score every symbol
+        # Score every symbol; filter price $10–$500
         scored = []
         for sym in all_syms:
-            s = self._score_symbol(sym)
             bars = self._bar_cache.get(sym, [])
-            price = round(bars[-1]["close"], 2) if bars else 0
+            if not bars:
+                continue
+            price = round(bars[-1]["close"], 2)
+            if not (10.0 <= price <= 500.0):
+                continue          # outside tradeable price range
+            s = self._score_symbol(sym)
             if s > 0:
                 scored.append({"symbol": sym, "score": s, "price": price})
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         top_picks = [s for s in scored if s["score"] >= RiskConfig.MIN_STOCK_SCORE]
 
+        # Build the daily 26-stock watchlist
+        daily_wl = await self._build_daily_watchlist(scored)
+
         await self.save_state("premarket_scan", {
-            "scored":    scored[:40],
+            "scored":    scored[:50],
             "top_picks": top_picks,
             "threshold": RiskConfig.MIN_STOCK_SCORE,
             "timestamp": datetime.utcnow().isoformat(),
         }, ttl=3600 * 8)
 
+        await self.save_state("daily_watchlist", {
+            **daily_wl,
+            "timestamp": datetime.utcnow().isoformat(),
+        }, ttl=3600 * 10)
+
         self.log(
-            f"Premarket scan: {len(scored)} symbols scored | "
-            f"{len(top_picks)} qualify (score ≥ {RiskConfig.MIN_STOCK_SCORE}) | "
-            f"top3={[s['symbol'] for s in top_picks[:3]]}"
+            f"Premarket scan: {len(scored)} symbols scored (price-filtered) | "
+            f"{len(top_picks)} qualify (≥{RiskConfig.MIN_STOCK_SCORE}) | "
+            f"daily_wl={len(daily_wl.get('all_26', []))} | "
+            f"top10={daily_wl.get('top_10_active', [])[:5]}"
         )
 
-        # Publish top picks so downstream bots react immediately
         for pick in top_picks[:15]:
             await self.publish(RedisConfig.CHANNEL_MARKET_DATA, {
                 "type":      "premarket_pick",
@@ -384,6 +399,109 @@ class DataAgent(BaseBot):
                 "price":     pick["price"],
                 "timestamp": datetime.utcnow().isoformat(),
             })
+
+    async def _find_sector_leaders(self) -> list[str]:
+        """Return top 3 symbols in today's strongest sector (from cached bar data)."""
+        etfs = list(UniverseConfig.SECTOR_ETFS.keys())
+        best_etf, best_pct = "", -999.0
+        for etf in etfs:
+            bars = self._bar_cache.get(etf, [])
+            if len(bars) >= 2 and bars[-2]["close"] > 0:
+                pct = (bars[-1]["close"] - bars[-2]["close"]) / bars[-2]["close"] * 100
+                if pct > best_pct:
+                    best_pct, best_etf = pct, etf
+        if not best_etf:
+            return []
+        members = UniverseConfig.SECTOR_ETFS.get(best_etf, [])
+        scored = [(sym, self._score_symbol(sym)) for sym in members]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        leaders = [s[0] for s in scored[:3]]
+        self.log(f"Sector leaders: {best_etf} ({best_pct:+.2f}%) → {leaders}")
+        return leaders
+
+    async def _find_earnings_momentum(self) -> list[str]:
+        """
+        Find stocks with recent earnings beats by reading bot01's catalyst scan.
+        These stocks often continue moving 1-2 days after reporting.
+        """
+        BEAT_WORDS = {"earnings_beat", "beat", "exceeded", "surpassed", "record eps"}
+        result: list[str] = []
+        try:
+            summary = await self.bus.get_state("bot1:latest_summary") or {}
+            catalysts = (
+                summary.get("recent_catalysts") or
+                summary.get("catalysts") or
+                summary.get("top_catalysts") or []
+            )
+            for item in catalysts:
+                catalyst_str = (item.get("catalyst") or "").lower()
+                if any(w in catalyst_str for w in BEAT_WORDS):
+                    for sym in (item.get("symbols") or []):
+                        if sym not in result:
+                            result.append(sym)
+                            if len(result) >= 3:
+                                return result
+        except Exception as e:
+            self.log(f"Earnings momentum lookup error: {e}", "warning")
+        if result:
+            self.log(f"Earnings momentum plays: {result}")
+        return result[:3]
+
+    async def _build_daily_watchlist(self, premarket_scored: list[dict]) -> dict:
+        """
+        Assemble today's 26-stock watchlist:
+          10 core (always-on fast movers from WATCHLIST)
+        + 10 dynamic scanner picks (highest premarket score, not already in core)
+        +  3 sector leaders (top 3 in strongest sector)
+        +  3 earnings momentum plays (stocks that beat earnings yesterday)
+        ──────────────────────────────────────────────────────────────────
+        Score all 26, rank, expose top 10 as the active trading list.
+        """
+        core = [s for s in UniverseConfig.WATCHLIST if s not in UniverseConfig.BEAR_ETFS][:10]
+
+        score_map = {s["symbol"]: s for s in premarket_scored}
+        dynamic = [
+            s["symbol"] for s in premarket_scored
+            if s["symbol"] not in core
+        ][:10]
+
+        sector_leaders  = await self._find_sector_leaders()
+        earnings_plays  = await self._find_earnings_momentum()
+
+        # Combine preserving priority order, deduplicating
+        seen: set[str] = set()
+        all_26: list[str] = []
+        for sym in core + dynamic + sector_leaders + earnings_plays:
+            if sym not in seen:
+                seen.add(sym)
+                all_26.append(sym)
+        all_26 = all_26[:26]
+
+        # Rank all 26 by score
+        ranked = sorted(
+            [{"symbol": sym,
+              "score": score_map.get(sym, {}).get("score", 0),
+              "price": score_map.get(sym, {}).get("price", 0),
+              "category": (
+                  "core"           if sym in core else
+                  "sector_leader"  if sym in sector_leaders else
+                  "earnings_play"  if sym in earnings_plays else
+                  "dynamic_scan"
+              )}
+             for sym in all_26],
+            key=lambda x: x["score"],
+            reverse=True,
+        )
+        top_10 = [s["symbol"] for s in ranked[:UniverseConfig.MAX_DAILY_ACTIVE_TRADES]]
+
+        return {
+            "all_26":        ranked,
+            "top_10_active": top_10,
+            "core":          core,
+            "dynamic":       dynamic,
+            "sector_leaders": sector_leaders,
+            "earnings_plays": earnings_plays,
+        }
 
     # ── 9am Morning scan (runs ONCE per day) ──────────────────────────────────
 

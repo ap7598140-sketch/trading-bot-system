@@ -56,22 +56,54 @@ class RedisConfig:
 
 # ── Risk limits ────────────────────────────────────────────────────────────────
 class RiskConfig:
-    MAX_POSITION_SIZE       = float(os.getenv("MAX_POSITION_SIZE", "10000"))
-    MAX_PORTFOLIO_RISK      = float(os.getenv("MAX_PORTFOLIO_RISK", "0.025"))
-    MAX_DAILY_LOSS          = 0.05    # 5% daily loss limit (portfolio %)
-    MAX_OPEN_POSITIONS      = 10      # max simultaneous open positions
-    MAX_DAILY_TRADES        = 20      # max orders submitted per day
-    MAX_SINGLE_POSITION_USD = 500.0   # hard $500 cap per individual trade
-    CONFIDENCE_THRESHOLD    = 0.80    # minimum confidence to approve a trade
-    STOP_LOSS_PCT           = 0.06    # 6% stop  →  ~$30 loss on $500 position
-    TAKE_PROFIT_PCT         = 0.12    # 12% take →  ~$60 profit  (2:1 RR)
-    MAX_SECTOR_EXPOSURE     = 0.30    # 30% in any one sector
-    # Smart selection thresholds
-    MIN_STOCK_SCORE         = 70      # premarket score required (1–100)
-    MIN_WINNER_CRITERIA     = 4       # of 6 criteria that must pass
-    MAX_TRADE_LOSS_USD      = 30.0    # hard dollar cap per trade loss
-    DAILY_LOSS_LIMIT_USD    = 50.0    # halt trading after $50 daily loss
-    MIN_TRADE_PROFIT_USD    = 50.0    # minimum target profit per trade
+    MAX_POSITION_SIZE        = float(os.getenv("MAX_POSITION_SIZE", "10000"))
+    MAX_PORTFOLIO_RISK       = float(os.getenv("MAX_PORTFOLIO_RISK", "0.025"))
+    MAX_DAILY_LOSS           = 0.05    # 5% daily loss limit (portfolio %)
+    MAX_OPEN_POSITIONS       = 10
+    MAX_DAILY_TRADES         = 30
+
+    # ── Position sizing by grade ─────────────────────────────────────────────
+    GRADE_A_POSITION_USD     = 3000.0  # Grade A signal → $3,000 position
+    GRADE_B_POSITION_USD     = 2000.0  # Grade B signal → $2,000 position
+    MIN_SINGLE_POSITION_USD  = 1500.0  # floor after regime scaling
+    MAX_SINGLE_POSITION_USD  = 3000.0  # ceiling (Grade A)
+
+    # ── Stop / take-profit ────────────────────────────────────────────────────
+    CONFIDENCE_THRESHOLD     = 0.80
+    STOP_LOSS_PCT            = 0.015   # 1.5% → ~$45 on $3k, ~$30 on $2k
+    TAKE_PROFIT_PCT          = 0.03    # 3%   → 2:1 RR
+
+    # ── Partial close + trailing stop ─────────────────────────────────────────
+    PARTIAL_CLOSE_TRIGGER_PCT     = 0.02    # sell 50% of position at +2%
+    PARTIAL_CLOSE_PCT             = 0.50    # fraction to close at first target
+    TRAILING_STOP_USD             = 15.0    # $15 trailing stop on remainder
+    TRAILING_ACTIVATE_PROFIT_USD  = 40.0    # activate trailing stop when up $40
+
+    # ── Compound winners ──────────────────────────────────────────────────────
+    COMPOUND_TRIGGER_PROFIT_USD   = 50.0    # add 50% more when up $50
+
+    # ── Daily caps ────────────────────────────────────────────────────────────
+    MAX_TRADE_LOSS_USD       = 75.0    # max loss per individual trade
+    DAILY_LOSS_LIMIT_USD     = 150.0   # halt all trading at -$150/day
+    DAILY_PROFIT_TARGET_USD  = 100.0   # stop new trades at +$100/day (lock it in)
+
+    # ── Signal quality ────────────────────────────────────────────────────────
+    MIN_STOCK_SCORE          = 70      # premarket score required (1-100)
+    MIN_WINNER_CRITERIA      = 4       # of 6 criteria that must pass
+    VOLUME_CONFIRMATION_X    = 2.0     # require 2× average volume
+    MIN_GRADE_A_PROFIT_USD   = 75.0    # minimum target $ profit for Grade A
+    MIN_GRADE_B_PROFIT_USD   = 50.0    # minimum target $ profit for Grade B
+    MIN_REWARD_RISK_RATIO    = 2.0     # always 2:1
+    MAX_SECTOR_EXPOSURE      = 0.30
+
+
+# ── Trading windows ────────────────────────────────────────────────────────────
+class TradingWindowConfig:
+    """Only open new positions during high-momentum windows (EST)."""
+    MORNING_OPEN    = (9,  45)   # 9:45am
+    MORNING_CLOSE   = (10, 30)   # 10:30am
+    AFTERNOON_OPEN  = (14,  0)   # 2:00pm
+    AFTERNOON_CLOSE = (15,  0)   # 3:00pm
 
 
 # ── Trading universe ───────────────────────────────────────────────────────────
@@ -79,43 +111,71 @@ class UniverseConfig:
     # Inverse ETFs for bear/crash regime
     BEAR_ETFS = ["SQQQ", "SPXS", "SOXS"]
 
-    # Core watchlist (continuously monitored)
+    # Core 10 always-on fast movers (+ inverse ETFs kept for bear regime)
     WATCHLIST = [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
-        "META", "TSLA", "SPY",  "QQQ",  "AMD",
-        "NFLX", "JPM",  "BAC",  "GS",   "COIN",
-        "SQQQ", "SPXS", "SOXS",   # inverse ETFs for bear regime
-    ]
-
-    # Expanded universe for the 9am morning scan (top volume/gap candidates)
-    SCAN_UNIVERSE = [
-        # Mega-cap tech
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO",
-        # Semiconductors
-        "AMD", "INTC", "MU", "QCOM", "ARM", "SMCI",
-        # Software / Cloud
-        "CRM", "ORCL", "ADBE", "NOW", "SNOW", "PLTR", "PANW",
-        # Finance
-        "JPM", "BAC", "GS", "MS", "WFC", "V", "MA", "SCHW", "COIN",
-        # Energy
-        "XOM", "CVX", "COP", "OXY",
-        # Healthcare / Pharma / Biotech
-        "LLY", "UNH", "PFE", "ABBV", "MRK", "AMGN", "MRNA", "BIIB",
-        # Consumer
-        "COST", "WMT", "TGT", "NKE", "SBUX", "MCD",
-        # Streaming / Media
-        "NFLX", "DIS", "SPOT",
-        # EV / Autos
-        "F", "GM", "RIVN",
-        # Crypto-linked
-        "HOOD", "MSTR",
-        # Sector ETFs (for sector-strength check)
-        "XLK", "XLF", "XLE", "XLV", "XLI", "XLY",
-        # Broad market ETFs
-        "SPY", "QQQ", "IWM",
-        # Inverse ETFs (bear/crash regime)
+        "NVDA", "TSLA", "META", "AMD", "GOOGL",
+        "AMZN", "AAPL", "MSFT", "SPY",  "QQQ",
         "SQQQ", "SPXS", "SOXS",
     ]
+
+    # ── ~300-symbol scan universe (filters price $10-$500 at runtime) ──────────
+    SCAN_UNIVERSE = [
+        # ── Mega-cap tech ──────────────────────────────────────────────────────
+        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO",
+        # ── Semiconductors ────────────────────────────────────────────────────
+        "AMD", "INTC", "MU", "QCOM", "ARM", "SMCI", "MRVL", "KLAC",
+        "LRCX", "AMAT", "NXPI", "ON", "TXN", "ADI", "MPWR", "WOLF",
+        # ── Software / Cloud / Cybersecurity ─────────────────────────────────
+        "CRM", "ORCL", "ADBE", "NOW", "SNOW", "PLTR", "PANW", "CRWD",
+        "ZS", "FTNT", "S", "NET", "DDOG", "OKTA", "HUBS", "MDB",
+        "TEAM", "GTLB", "PATH", "U", "RBLX", "COIN",
+        # ── Finance / Fintech ─────────────────────────────────────────────────
+        "V", "MA", "SCHW", "PYPL", "SQ", "AFRM", "SOFI", "NU",
+        "IBKR", "ICE", "CME", "MELI", "HOOD", "XP",
+        # ── Consumer / Retail ─────────────────────────────────────────────────
+        "COST", "WMT", "TGT", "NKE", "SBUX", "MCD", "HD", "LOW",
+        "SHOP", "ETSY", "W", "DG", "DLTR", "ROSS", "TJX", "CHWY",
+        # ── Streaming / Media / Entertainment ────────────────────────────────
+        "NFLX", "DIS", "SPOT", "WBD", "CMCSA", "PARA",
+        # ── Healthcare / Pharma ───────────────────────────────────────────────
+        "LLY", "UNH", "PFE", "ABBV", "MRK", "AMGN", "MRNA", "BIIB",
+        "REGN", "GILD", "VRTX", "BMY", "CVS", "CI", "HUM", "ELV",
+        # ── Biotech ───────────────────────────────────────────────────────────
+        "BNTX", "SGEN", "INCY", "EXAS", "RARE", "SRPT", "ALNY",
+        # ── Energy ────────────────────────────────────────────────────────────
+        "XOM", "CVX", "COP", "OXY", "EOG", "DVN", "FANG", "MPC",
+        "PSX", "VLO", "SLB", "HAL", "BKR",
+        # ── Industrials / Defense ─────────────────────────────────────────────
+        "CAT", "DE", "HON", "GE", "ETN", "ROK", "EMR", "ITW",
+        "LMT", "RTX", "NOC", "GD", "BA",
+        # ── Transportation ────────────────────────────────────────────────────
+        "UNP", "CSX", "NSC", "UPS", "FDX", "DAL", "AAL", "UAL", "LUV",
+        # ── EV / Autos ────────────────────────────────────────────────────────
+        "F", "GM", "RIVN", "LCID", "NIO", "XPEV", "LI",
+        # ── Travel / Hotels ───────────────────────────────────────────────────
+        "ABNB", "BKNG", "EXPE", "MAR", "HLT", "CCL", "RCL", "NCLH",
+        # ── Crypto-linked ─────────────────────────────────────────────────────
+        "MSTR", "RIOT", "MARA", "CLSK",
+        # ── Chinese / Intl tech ───────────────────────────────────────────────
+        "BABA", "JD", "PDD", "BIDU", "SE",
+        # ── Real Estate / REITs ───────────────────────────────────────────────
+        "AMT", "EQIX", "PLD", "SPG", "CCI", "SBAC", "DLR",
+        # ── Telecom ───────────────────────────────────────────────────────────
+        "T", "VZ", "TMUS",
+        # ── Utilities ─────────────────────────────────────────────────────────
+        "NEE", "DUK", "SO", "AES",
+        # ── Materials ─────────────────────────────────────────────────────────
+        "FCX", "NEM", "GOLD", "AA", "NUE", "CLF",
+        # ── Sector ETFs (for sector-strength check) ───────────────────────────
+        "XLK", "XLF", "XLE", "XLV", "XLI", "XLY",
+        # ── Broad market ETFs ─────────────────────────────────────────────────
+        "SPY", "QQQ", "IWM", "ARKK",
+        # ── Inverse ETFs (bear/crash regime) ─────────────────────────────────
+        "SQQQ", "SPXS", "SOXS",
+    ]
+
+    # How many stocks to actively trade from the daily 26-stock watchlist
+    MAX_DAILY_ACTIVE_TRADES = 10
 
     # Sector ETF → member symbols mapping (for sector filter in bot05)
     SECTOR_ETFS = {

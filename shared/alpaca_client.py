@@ -186,6 +186,35 @@ class AlpacaClient:
 
     # ── Orders ─────────────────────────────────────────────────────────────────
 
+    def close_partial_position(self, symbol: str, qty: float) -> dict:
+        """Close a specific share quantity of an existing position at market."""
+        req = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        )
+        order = self.trading.submit_order(req)
+        return {"id": str(order.id), "status": order.status.value, "symbol": symbol}
+
+    def submit_trailing_stop_order(self, symbol: str, qty: float,
+                                   side: str, trail_price: float) -> dict:
+        """
+        Submit a trailing stop order.
+        trail_price = dollar amount the stop trails below the high-water mark.
+        As price rises, the stop rises with it; never moves down.
+        """
+        from alpaca.trading.requests import TrailingStopOrderRequest
+        req = TrailingStopOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL if side == "sell" else OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            trail_price=str(trail_price),
+        )
+        order = self.trading.submit_order(req)
+        return {"id": str(order.id), "status": order.status.value, "symbol": symbol}
+
     def submit_market_order(self, symbol: str, qty: float,
                             side: str, time_in_force: str = "day") -> dict:
         req = MarketOrderRequest(
