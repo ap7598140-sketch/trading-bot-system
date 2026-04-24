@@ -104,6 +104,19 @@ class TradingWindowConfig:
     MORNING_CLOSE   = (10, 30)   # 10:30am
     AFTERNOON_OPEN  = (14,  0)   # 2:00pm
     AFTERNOON_CLOSE = (15,  0)   # 3:00pm
+    SKIP_START      = (11,  0)   # dead zone start
+    SKIP_END        = (13,  0)   # dead zone end
+    EOD_CLOSE       = (15, 50)   # hard close time
+    TIMEZONE        = "America/New_York"
+
+    # String forms for display / comparison convenience
+    MORNING_START   = "09:45"
+    MORNING_END     = "10:30"
+    AFTERNOON_START = "14:00"
+    AFTERNOON_END   = "15:00"
+    SKIP_START_STR  = "11:00"
+    SKIP_END_STR    = "13:00"
+    EOD_CLOSE_STR   = "15:50"
 
 
 # ── Trading universe ───────────────────────────────────────────────────────────
