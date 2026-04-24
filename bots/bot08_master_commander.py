@@ -386,12 +386,11 @@ class MasterCommander(BaseBot):
 
     async def _ai_command_review(self, system_state: dict) -> dict:
         """
-        Sonnet reviews compressed system state (~75 tokens) and issues commands.
-        Cached for 5 min — same conditions = same response, zero extra Sonnet cost.
+        Sonnet reviews live system state and issues commands.
+        Never cached — each review reflects the current portfolio/P&L.
         Only called when market is open and data feeds have content.
         """
         summary = LLMRouter.compress_system_state(system_state)
-        ck      = LLMRouter.cache_key(summary)
 
         prompt = (
             "Commander. Only halt if pnl<-3%. Ignore empty data feeds.\n"
@@ -405,7 +404,6 @@ class MasterCommander(BaseBot):
             [{"role": "user", "content": prompt}],
             prefer="sonnet",
             max_tokens=150,
-            cache_key=ck,
         )
         if not raw:
             return {"trading_allowed": not self._system_halted,

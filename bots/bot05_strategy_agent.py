@@ -543,37 +543,40 @@ class StrategyAgent(BaseBot):
     # ── AI strategy generation ─────────────────────────────────────────────────
 
     async def _generate_trade_setups(self, signals: dict) -> list[dict]:
-        """Use Sonnet (compressed prompt, cached) to synthesise signals into trade setups."""
+        """Use Sonnet with full signal context to synthesise trade setups.
+        Never cached — every call is fresh so prices are always current."""
 
-        PV      = self._portfolio_value if self._portfolio_value > 0 else 1000.0
         MAX_POS = RiskConfig.MAX_SINGLE_POSITION_USD
         sl_pct, tp_pct = self._regime_sl_tp()
 
-        # Compress signals to ~60-80 tokens (no raw history, no indented JSON)
-        compressed = LLMRouter.compress_signals(signals)
         sector_tag = f"sector={self._strongest_sector}" if self._strongest_sector else ""
         regime_tag = f"regime={self._current_regime} scale={self._regime_scale:.0%} cb={self._cb_scale:.0%}"
 
         # Bear/crash: restrict to inverse ETFs only
         bear_note = ""
         if self._current_regime in ("bear", "crash"):
-            bear_note = f"BEAR REGIME: ONLY suggest inverse ETFs {UniverseConfig.BEAR_ETFS}. Long only on these. "
+            bear_note = f"BEAR REGIME: ONLY suggest inverse ETFs {UniverseConfig.BEAR_ETFS}. Long only on these."
 
-        # Cache key: hash of compressed signals + sizing params
-        ck = LLMRouter.cache_key(compressed, int(MAX_POS), sector_tag, self._current_regime)
-
+        # Pass full signal context — Claude needs the actual price to generate a
+        # valid entry_price. Never compress: stripping price_context caused stale prices.
         prompt = (
-            f"Expert trader. Output 1-3 setups. ONLY Grade A ($3k) or B ($2k) signals. "
-            f"SL={sl_pct*100:.1f}% TP={tp_pct*100:.1f}% MinRR=2:1 conf>={RiskConfig.CONFIDENCE_THRESHOLD}. "
-            f"GradeA target≥${RiskConfig.MIN_GRADE_A_PROFIT_USD:.0f} "
-            f"GradeB target≥${RiskConfig.MIN_GRADE_B_PROFIT_USD:.0f}. "
-            + (f"{sector_tag} " if sector_tag else "")
-            + f"{regime_tag}. {bear_note}"
-            "Each setup MUST include 'catalyst' (earnings/upgrade/momentum/rotation) and 'grade' (A or B).\n"
-            f"Signals:{LLMRouter.j(compressed)}\n"
-            "JSON:{\"setups\":[{\"symbol\":\"X\",\"direction\":\"long\","
-            "\"entry_price\":0,\"confidence\":0.8,\"grade\":\"A\","
-            "\"timeframe\":\"intraday\",\"thesis\":\"\",\"catalyst\":\"\","
+            f"You are an expert intraday trader. Analyse the signals below and output 1-3 high-conviction trade setups.\n"
+            f"Rules:\n"
+            f"  - Only Grade A (${RiskConfig.GRADE_A_POSITION_USD:,.0f} position) or Grade B (${RiskConfig.GRADE_B_POSITION_USD:,.0f} position) signals\n"
+            f"  - Stop loss: {sl_pct*100:.1f}% | Take profit: {tp_pct*100:.1f}% | Minimum RR: 2:1\n"
+            f"  - Grade A profit target >= ${RiskConfig.MIN_GRADE_A_PROFIT_USD:.0f} | Grade B >= ${RiskConfig.MIN_GRADE_B_PROFIT_USD:.0f}\n"
+            f"  - Minimum confidence: {RiskConfig.CONFIDENCE_THRESHOLD:.0%}\n"
+            f"  - entry_price MUST equal the current price shown in price_context for that symbol\n"
+            f"  - Each setup MUST include a specific catalyst (earnings beat/upgrade/breakout/sector rotation)\n"
+            + (f"  - Strongest sector today: {sector_tag}\n" if sector_tag else "")
+            + f"  - {regime_tag}\n"
+            + (f"  - {bear_note}\n" if bear_note else "")
+            + f"\nFull market signals:\n{LLMRouter.j(signals)}\n\n"
+            "Respond ONLY with valid JSON (no markdown, no explanation):\n"
+            "{\"setups\":[{\"symbol\":\"TICKER\",\"direction\":\"long\","
+            "\"entry_price\":0.0,\"confidence\":0.85,\"grade\":\"A\","
+            "\"timeframe\":\"intraday\",\"thesis\":\"one sentence why\","
+            "\"catalyst\":\"specific catalyst\","
             "\"required_confirmations\":[]}],"
             "\"market_bias\":\"neutral\",\"notes\":\"\"}"
         )
@@ -581,8 +584,7 @@ class StrategyAgent(BaseBot):
         raw = await self._router.call(
             [{"role": "user", "content": prompt}],
             prefer="sonnet",
-            max_tokens=600,
-            cache_key=ck,
+            max_tokens=800,
         )
         if not raw:
             return [], "neutral", ""
