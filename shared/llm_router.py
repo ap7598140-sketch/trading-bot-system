@@ -78,6 +78,9 @@ class LLMRouter:
                     model=model, max_tokens=max_tokens, messages=messages
                 ),
             )
+            # Guard against empty content list or whitespace-only responses
+            if not resp.content:
+                return ""
             text = resp.content[0].text.strip()
         except Exception:
             return ""

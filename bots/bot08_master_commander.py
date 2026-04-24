@@ -409,31 +409,35 @@ class MasterCommander(BaseBot):
             return {"trading_allowed": not self._system_halted,
                     "session_action": "continue", "risk_level": "medium", "notes": ""}
         try:
-            # Strip markdown code fences
+            # Strip markdown code fences (handles ```json, ```, ``` alone)
             text = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
-            # Strip illegal control characters (\x00-\x08, \x0b-\x0c, \x0e-\x1f)
+            # Strip illegal control characters (\x00-\x08, \x0b, \x0c, \x0e-\x1f)
             text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
-            # Strip JS comments and trailing commas
+            # Strip JS-style comments and trailing commas
             text = re.sub(r"//[^\n]*", "", text)
             text = re.sub(r",\s*([}\]])", r"\1", text)
 
-            # Extract outermost { ... } block
+            # Extract outermost { ... } block — raise if nothing found so the
+            # except block can return the safe default instead of passing an
+            # empty or prose string to json.loads
             start = text.find("{")
-            if start != -1:
-                depth, in_str, escape, end = 0, False, False, -1
-                for i, ch in enumerate(text[start:], start):
-                    if escape: escape = False; continue
-                    if ch == "\\" and in_str: escape = True; continue
-                    if ch == '"': in_str = not in_str
-                    elif not in_str:
-                        if ch == "{": depth += 1
-                        elif ch == "}":
-                            depth -= 1
-                            if depth == 0: end = i; break
-                if end != -1:
-                    text = text[start:end + 1]
+            if start == -1:
+                raise ValueError(f"no JSON object in response: {text[:80]!r}")
+            depth, in_str, escape, end = 0, False, False, -1
+            for i, ch in enumerate(text[start:], start):
+                if escape: escape = False; continue
+                if ch == "\\" and in_str: escape = True; continue
+                if ch == '"': in_str = not in_str
+                elif not in_str:
+                    if ch == "{": depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0: end = i; break
+            if end == -1:
+                raise ValueError(f"unterminated JSON object in response: {text[:80]!r}")
+            text = text[start:end + 1]
 
-            # strict=False allows any surviving control chars inside strings
+            # strict=False tolerates any surviving control chars inside strings
             return json.loads(text, strict=False)
         except Exception as e:
             self.log(f"AI review parse error: {e}", "warning")
