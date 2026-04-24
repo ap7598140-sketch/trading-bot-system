@@ -10,6 +10,7 @@ Role   : The brain that synthesises ALL input signals into concrete trade setups
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -589,10 +590,37 @@ class StrategyAgent(BaseBot):
         if not raw:
             return [], "neutral", ""
 
+        parsed = self._parse_json_safe(raw)
+
+        # ── Retry with a strict prompt if first parse failed ─────────────────
+        if parsed is None:
+            self.log("Strategy parse failed on first attempt — retrying with strict prompt", "warning")
+            retry_prompt = (
+                "Return ONLY valid JSON. No markdown, no code blocks, "
+                "no newlines inside string values.\n"
+                "Format exactly (fill in real values):\n"
+                "{\"setups\":[{\"symbol\":\"TICKER\",\"direction\":\"long\","
+                "\"entry_price\":0.0,\"confidence\":0.85,\"grade\":\"A\","
+                "\"timeframe\":\"intraday\",\"thesis\":\"reason\","
+                "\"catalyst\":\"catalyst\",\"required_confirmations\":[]}],"
+                "\"market_bias\":\"neutral\",\"notes\":\"\"}"
+            )
+            raw2 = await self._router.call(
+                [{"role": "user", "content": prompt},
+                 {"role": "assistant", "content": raw},
+                 {"role": "user", "content": retry_prompt}],
+                prefer="sonnet",
+                max_tokens=600,
+            )
+            parsed = self._parse_json_safe(raw2) if raw2 else None
+
+        # ── Fallback: build setup from top momentum signal ────────────────────
+        if parsed is None:
+            self.log("Strategy parse failed after retry — using momentum fallback", "warning")
+            fallback = self._momentum_fallback_setups()
+            return fallback, "neutral", "parse_error_momentum_fallback"
+
         try:
-            if "```" in raw:
-                raw = raw.split("```")[1].lstrip("json").strip()
-            parsed = json.loads(raw)
             setups = parsed.get("setups", [])
 
             # ALWAYS overwrite stop/take-profit and position size — never trust Claude's values
@@ -601,29 +629,25 @@ class StrategyAgent(BaseBot):
                 entry     = float(s.get("entry_price") or 0)
                 direction = (s.get("direction") or "long").lower()
 
-                # Skip setups with no entry price — nothing to calculate from
                 if entry <= 0:
                     self.log(f"Dropped setup for {s.get('symbol')}: entry_price=0", "warning")
                     continue
 
-                # Stop/take always calculated from config — never trust AI values
                 sl_pct, tp_pct = self._regime_sl_tp()
                 if direction == "long":
                     s["stop_loss"]   = round(entry * (1 - sl_pct), 4)
                     s["take_profit"] = round(entry * (1 + tp_pct), 4)
-                else:  # short
+                else:
                     s["stop_loss"]   = round(entry * (1 + sl_pct), 4)
                     s["take_profit"] = round(entry * (1 - tp_pct), 4)
 
-                # Recalculate position size using live grade-based sizing
                 ai_size = s.get("position_size_usd", "?")
                 setup_grade = s.get("grade") or self._get_symbol_grade(s.get("symbol", ""))
-                s["grade"]            = setup_grade
+                s["grade"]             = setup_grade
                 s["position_size_usd"] = self._safe_position_size(
                     entry, s["stop_loss"], grade=setup_grade
                 )
 
-                # Final guard — never send a setup missing critical fields
                 if not s.get("stop_loss") or not s.get("take_profit"):
                     self.log(f"Dropped setup for {s.get('symbol')}: sl/tp still zero", "warning")
                     continue
@@ -636,11 +660,115 @@ class StrategyAgent(BaseBot):
                 )
                 valid_setups.append(s)
 
-            setups = valid_setups
-            return setups, parsed.get("market_bias", "neutral"), parsed.get("notes", "")
+            return valid_setups, parsed.get("market_bias", "neutral"), parsed.get("notes", "")
         except Exception as e:
-            self.log(f"Strategy generation error: {e}", "error")
+            self.log(f"Strategy post-parse error: {e}", "error")
             return [], "neutral", ""
+
+    @staticmethod
+    def _parse_json_safe(raw: str) -> Optional[dict]:
+        """
+        Robustly parse a JSON object from a Claude response.
+        Handles: markdown code fences, control characters, trailing commas.
+        Returns the parsed dict, or None if all attempts fail.
+        """
+        if not raw:
+            return None
+
+        text = raw
+
+        # 1. Strip markdown code fences (```json ... ``` or ``` ... ```)
+        text = re.sub(r"```[a-zA-Z]*", "", text).replace("```", "").strip()
+
+        # 2. Strip ASCII control characters that are illegal in JSON strings
+        #    (keeps \t \n \r which json.loads handles, removes \x00-\x08, \x0b-\x0c, \x0e-\x1f)
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
+
+        # 3. Strip JS-style comments
+        text = re.sub(r"//[^\n]*", "", text)
+
+        # 4. Extract the outermost { ... } block
+        start = text.find("{")
+        if start == -1:
+            return None
+        depth, in_str, escape, end = 0, False, False, -1
+        for i, ch in enumerate(text[start:], start):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_str:
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+            elif not in_str:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+        if end == -1:
+            return None
+        text = text[start:end + 1]
+
+        # 5. First parse attempt — strict=False allows literal control chars in strings
+        try:
+            return json.loads(text, strict=False)
+        except json.JSONDecodeError:
+            pass
+
+        # 6. Second attempt after removing trailing commas and collapsing newlines
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+        text = re.sub(r"[\n\r]+", " ", text)
+        try:
+            return json.loads(text, strict=False)
+        except json.JSONDecodeError:
+            return None
+
+    def _momentum_fallback_setups(self) -> list[dict]:
+        """
+        Build up to one trade setup from the best available momentum signal.
+        Used when Sonnet returns unparseable JSON so trading never fully stops.
+        """
+        sl_pct, tp_pct = self._regime_sl_tp()
+        candidates = sorted(
+            self._momentum_signals[-30:],
+            key=lambda x: float(x.get("score") or 0),
+            reverse=True,
+        )
+        for m in candidates:
+            sym   = m.get("symbol", "")
+            grade = m.get("grade", "")
+            if not sym or grade not in ("A", "A+", "B", ""):
+                continue
+            md    = self._market_data.get(sym, {})
+            price = float(md.get("price") or 0)
+            if price <= 0:
+                continue
+            setup = {
+                "symbol":      sym,
+                "direction":   "long",
+                "entry_price": price,
+                "confidence":  float(m.get("score") or 0.70),
+                "grade":       grade,
+                "timeframe":   "intraday",
+                "thesis":      m.get("reason", "momentum signal"),
+                "catalyst":    f"momentum_grade_{grade}",
+                "required_confirmations": [],
+                "stop_loss":   round(price * (1 - sl_pct), 4),
+                "take_profit": round(price * (1 + tp_pct), 4),
+            }
+            setup["position_size_usd"] = self._safe_position_size(
+                price, setup["stop_loss"], grade=grade
+            )
+            self.log(
+                f"Momentum fallback setup: {sym} entry={price} "
+                f"sl={setup['stop_loss']} tp={setup['take_profit']} grade={grade}"
+            )
+            return [setup]
+        return []
 
     # ── Decision cycle ─────────────────────────────────────────────────────────
 

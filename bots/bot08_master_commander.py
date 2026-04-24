@@ -409,14 +409,19 @@ class MasterCommander(BaseBot):
             return {"trading_allowed": not self._system_halted,
                     "session_action": "continue", "risk_level": "medium", "notes": ""}
         try:
-            raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
-            raw = re.sub(r"//[^\n]*", "", raw)
-            raw = re.sub(r",\s*([}\]])", r"\1", raw)
-            raw = re.sub(r",\s*([}\]])", r"\1", raw)
-            start = raw.find("{")
+            # Strip markdown code fences
+            text = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
+            # Strip illegal control characters (\x00-\x08, \x0b-\x0c, \x0e-\x1f)
+            text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
+            # Strip JS comments and trailing commas
+            text = re.sub(r"//[^\n]*", "", text)
+            text = re.sub(r",\s*([}\]])", r"\1", text)
+
+            # Extract outermost { ... } block
+            start = text.find("{")
             if start != -1:
                 depth, in_str, escape, end = 0, False, False, -1
-                for i, ch in enumerate(raw[start:], start):
+                for i, ch in enumerate(text[start:], start):
                     if escape: escape = False; continue
                     if ch == "\\" and in_str: escape = True; continue
                     if ch == '"': in_str = not in_str
@@ -426,8 +431,10 @@ class MasterCommander(BaseBot):
                             depth -= 1
                             if depth == 0: end = i; break
                 if end != -1:
-                    raw = raw[start:end + 1]
-            return json.loads(raw)
+                    text = text[start:end + 1]
+
+            # strict=False allows any surviving control chars inside strings
+            return json.loads(text, strict=False)
         except Exception as e:
             self.log(f"AI review parse error: {e}", "warning")
             return {"trading_allowed": not self._system_halted,
