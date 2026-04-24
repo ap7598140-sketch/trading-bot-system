@@ -69,7 +69,7 @@ class RiskConfig:
     MAX_SINGLE_POSITION_USD  = 3000.0  # ceiling (Grade A)
 
     # ── Stop / take-profit ────────────────────────────────────────────────────
-    CONFIDENCE_THRESHOLD     = 0.80
+    CONFIDENCE_THRESHOLD     = 0.70
     STOP_LOSS_PCT            = 0.015   # 1.5% → ~$45 on $3k, ~$30 on $2k
     TAKE_PROFIT_PCT          = 0.03    # 3%   → 2:1 RR
 
