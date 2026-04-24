@@ -191,7 +191,10 @@ class DataAgent(BaseBot):
         self.alpaca  = AlpacaClient()
         self.client  = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
         self._router = LLMRouter(self.client)
-        self.symbols = list(dict.fromkeys(UniverseConfig.WATCHLIST))   # deduplicated
+        # Core watchlist + ETFs — all scanned every 5 min throughout the day
+        self.symbols = list(dict.fromkeys(
+            UniverseConfig.WATCHLIST + UniverseConfig.WATCHLIST_ETFS
+        ))
         self._bar_cache: dict[str, list[dict]] = {}   # rolling bar history
         self._last_ai_scan: datetime | None = None   # throttle AI scan to 10-min intervals
         self._morning_scan_done: bool = False   # runs once per day at 9am
@@ -457,7 +460,11 @@ class DataAgent(BaseBot):
         ──────────────────────────────────────────────────────────────────
         Score all 26, rank, expose top 10 as the active trading list.
         """
-        core = [s for s in UniverseConfig.WATCHLIST if s not in UniverseConfig.BEAR_ETFS][:10]
+        # Full core watchlist (all 40 stocks + ETFs, excluding inverse ETFs)
+        core = list(dict.fromkeys(
+            [s for s in UniverseConfig.WATCHLIST if s not in UniverseConfig.BEAR_ETFS]
+            + [s for s in UniverseConfig.WATCHLIST_ETFS if s not in UniverseConfig.BEAR_ETFS]
+        ))
 
         score_map = {s["symbol"]: s for s in premarket_scored}
         dynamic = [

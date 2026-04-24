@@ -99,36 +99,57 @@ class RiskConfig:
 
 # ── Trading windows ────────────────────────────────────────────────────────────
 class TradingWindowConfig:
-    """Only open new positions during high-momentum windows (EST)."""
-    MORNING_OPEN    = (9,  45)   # 9:45am
-    MORNING_CLOSE   = (10, 30)   # 10:30am
-    AFTERNOON_OPEN  = (14,  0)   # 2:00pm
-    AFTERNOON_CLOSE = (15,  0)   # 3:00pm
-    SKIP_START      = (11,  0)   # dead zone start
-    SKIP_END        = (13,  0)   # dead zone end
-    EOD_CLOSE       = (15, 50)   # hard close time
-    TIMEZONE        = "America/New_York"
+    """All-day trading: 9:35am–3:45pm EST. Skip first 5 min (volatile) and last 15 min."""
+    # Single continuous window — replaces the old two-slot morning/afternoon approach
+    OPEN  = (9,  35)   # 9:35am — 5 min after open
+    CLOSE = (15, 45)   # 3:45pm — 15 min before close
 
-    # String forms for display / comparison convenience
-    MORNING_START   = "09:45"
-    MORNING_END     = "10:30"
-    AFTERNOON_START = "14:00"
-    AFTERNOON_END   = "15:00"
-    SKIP_START_STR  = "11:00"
-    SKIP_END_STR    = "13:00"
-    EOD_CLOSE_STR   = "15:50"
+    # Kept for display / backwards-compat
+    EOD_CLOSE  = (15, 50)
+    TIMEZONE   = "America/New_York"
+    OPEN_STR   = "09:35"
+    CLOSE_STR  = "15:45"
+    EOD_CLOSE_STR = "15:50"
+
+    # Legacy aliases (bot05/bot07 updated to use OPEN/CLOSE directly)
+    MORNING_OPEN    = (9,  35)
+    MORNING_CLOSE   = (15, 45)
+    AFTERNOON_OPEN  = (9,  35)
+    AFTERNOON_CLOSE = (15, 45)
+    MORNING_START   = "09:35"
+    MORNING_END     = "15:45"
+    AFTERNOON_START = "09:35"
+    AFTERNOON_END   = "15:45"
+    SKIP_START      = (15, 45)
+    SKIP_END        = (15, 50)
+    SKIP_START_STR  = "15:45"
+    SKIP_END_STR    = "15:50"
 
 
 # ── Trading universe ───────────────────────────────────────────────────────────
 class UniverseConfig:
-    # Inverse ETFs for bear/crash regime
-    BEAR_ETFS = ["SQQQ", "SPXS", "SOXS"]
+    # Inverse / leveraged ETFs for bear/crash regime
+    BEAR_ETFS = ["SQQQ", "SPXS", "SOXS", "TQQQ", "SPXL", "SOXL"]
 
-    # Core 10 always-on fast movers (+ inverse ETFs kept for bear regime)
+    # ── Core watchlist: 40 high-momentum stocks always actively traded ─────────
     WATCHLIST = [
-        "NVDA", "TSLA", "META", "AMD", "GOOGL",
-        "AMZN", "AAPL", "MSFT", "SPY",  "QQQ",
-        "SQQQ", "SPXS", "SOXS",
+        # Mega-cap tech
+        "NVDA", "TSLA", "META", "AMD", "GOOGL", "AMZN", "AAPL", "MSFT",
+        # High-momentum tech / semis
+        "NFLX", "AVGO", "ORCL", "CRM", "ADBE", "INTC", "QCOM", "MU",
+        # High-volatility growth
+        "PLTR", "COIN", "HOOD", "SMCI", "AI", "MARA", "RIOT", "CLSK",
+        # Fintech / consumer growth
+        "SOFI", "RBLX", "U", "SNOW", "CRWD", "NET", "MDB", "OKTA",
+        # Travel / gig / social
+        "SHOP", "ABNB", "UBER", "LYFT", "DASH", "PINS", "SNAP", "RDDT",
+    ]
+
+    # ── ETFs scanned alongside the core watchlist ──────────────────────────────
+    WATCHLIST_ETFS = [
+        "SPY", "QQQ", "IWM", "DIA",
+        "XLK", "XLF", "XLE", "XLV", "XLI",
+        "SOXL", "SOXS", "TQQQ", "SQQQ", "SPXL", "SPXS",
     ]
 
     # ── ~300-symbol scan universe (filters price $10-$500 at runtime) ──────────
@@ -200,7 +221,7 @@ class UniverseConfig:
         "XLY": ["AMZN", "TSLA", "HD", "NKE", "SBUX", "MCD", "COST"],
     }
 
-    SCAN_INTERVAL_SECONDS = 600  # how often momentum scanner runs (10 min)
+    SCAN_INTERVAL_SECONDS = 300  # scan all 60+ stocks every 5 min — catch moves all day
     DATA_REFRESH_SECONDS  = 300  # how often data agent refreshes (5 min)
 
 

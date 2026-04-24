@@ -135,18 +135,15 @@ class ExecutionAgent(BaseBot):
 
         side = "buy" if direction == "long" else "sell"
 
-        # Only open new buy positions during allowed entry windows
+        # Only open new buy positions inside the all-day trading window
         if side == "buy":
-            t  = datetime.now(MARKET_TZ).time()
-            mo = dt_time(*TradingWindowConfig.MORNING_OPEN)
-            mc = dt_time(*TradingWindowConfig.MORNING_CLOSE)
-            ao = dt_time(*TradingWindowConfig.AFTERNOON_OPEN)
-            ac = dt_time(*TradingWindowConfig.AFTERNOON_CLOSE)
-            in_window = (mo <= t <= mc) or (ao <= t <= ac)
-            if not in_window:
+            t     = datetime.now(MARKET_TZ).time()
+            open_ = dt_time(*TradingWindowConfig.OPEN)
+            close = dt_time(*TradingWindowConfig.CLOSE)
+            if not (open_ <= t <= close):
                 self.log(
-                    f"SKIPPED {sym}: outside entry windows ({t.strftime('%H:%M')} ET) — "
-                    f"windows: 9:45-10:30am, 2:00-3:00pm",
+                    f"SKIPPED {sym}: outside trading window ({t.strftime('%H:%M')} ET) — "
+                    f"window: {TradingWindowConfig.OPEN_STR}–{TradingWindowConfig.CLOSE_STR}",
                     "warning",
                 )
                 return

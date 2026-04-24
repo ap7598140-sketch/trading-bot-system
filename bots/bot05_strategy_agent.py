@@ -237,14 +237,12 @@ class StrategyAgent(BaseBot):
         return RiskConfig.STOP_LOSS_PCT, RiskConfig.TAKE_PROFIT_PCT  # 1.5%, 3%
 
     def _in_trading_window(self) -> bool:
-        """True if current EST time is inside an allowed entry window."""
+        """True if current EST time is in the all-day trading window (9:35am–3:45pm)."""
         from datetime import time as dt_time
-        t  = datetime.now(MARKET_TZ).time()
-        mo = dt_time(*TradingWindowConfig.MORNING_OPEN)
-        mc = dt_time(*TradingWindowConfig.MORNING_CLOSE)
-        ao = dt_time(*TradingWindowConfig.AFTERNOON_OPEN)
-        ac = dt_time(*TradingWindowConfig.AFTERNOON_CLOSE)
-        return (mo <= t <= mc) or (ao <= t <= ac)
+        t     = datetime.now(MARKET_TZ).time()
+        open_ = dt_time(*TradingWindowConfig.OPEN)
+        close = dt_time(*TradingWindowConfig.CLOSE)
+        return open_ <= t <= close
 
     def _get_symbol_grade(self, sym: str) -> str:
         """Return the best momentum grade seen for a symbol from recent signals."""
