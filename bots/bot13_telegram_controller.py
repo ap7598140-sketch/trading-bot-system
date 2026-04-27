@@ -13,12 +13,20 @@ import json
 import os
 import signal
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, time as dt_time
 from typing import Optional
 
 import httpx
+import numpy as np
+import pandas as pd
+import pytz
 
-from config import AlertConfig, RedisConfig, AlpacaConfig, BASE_DIR
+from alpaca.data.timeframe import TimeFrame
+
+from config import (
+    AlertConfig, RedisConfig, AlpacaConfig, BASE_DIR,
+    UniverseConfig, TradingWindowConfig, AnthropicConfig,
+)
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 
@@ -208,24 +216,29 @@ class TelegramController(BaseBot):
 
     async def _dispatch(self, cmd: str, chat_id: str):
         handlers = {
-            "start":     self._cmd_start,
-            "stop":      self._cmd_stop,
-            "pause":     self._cmd_pause,
-            "resume":    self._cmd_resume,
-            "status":    self._cmd_status,
-            "profit":    self._cmd_profit,
-            "positions": self._cmd_positions,
-            "close":     self._cmd_close,
-            "restart":   self._cmd_restart,
-            "kill":      self._cmd_kill,
+            "start":       self._cmd_start,
+            "stop":        self._cmd_stop,
+            "pause":       self._cmd_pause,
+            "resume":      self._cmd_resume,
+            "status":      self._cmd_status,
+            "profit":      self._cmd_profit,
+            "positions":   self._cmd_positions,
+            "close":       self._cmd_close,
+            "restart":     self._cmd_restart,
+            "kill":        self._cmd_kill,
+            "backtest":    self._cmd_backtest,
+            "mocktest":    self._cmd_mocktest,
+            "signaltest":  self._cmd_signaltest,
+            "healthcheck": self._cmd_healthcheck,
         }
         handler = handlers.get(cmd)
         if handler:
             await handler(chat_id)
         else:
             await self._send(chat_id,
-                "Unknown command. Available: /start /stop /pause /resume "
-                "/status /profit /positions /close /restart /kill"
+                "Unknown command. Available:\n"
+                "/start /stop /pause /resume /status /profit /positions /close /restart /kill\n"
+                "/backtest /mocktest /signaltest /healthcheck"
             )
 
     # ── Command handlers ───────────────────────────────────────────────────────
@@ -495,6 +508,473 @@ class TelegramController(BaseBot):
         self.log("Operator command: /kill — sending SIGTERM", "critical")
         await asyncio.sleep(1)
         os.kill(os.getpid(), signal.SIGTERM)
+
+    # ── Simulation / diagnostic commands ──────────────────────────────────────
+
+    async def _cmd_backtest(self, chat_id: str):
+        """Run a backtest on 90 days of historical daily bars for the top 10 watchlist symbols."""
+        await self._send(chat_id,
+            "🔄 <b>Running backtest — last 90 days...</b>\n"
+            "Fetching daily bars for top 10 symbols."
+        )
+        try:
+            loop    = asyncio.get_event_loop()
+            symbols = UniverseConfig.WATCHLIST[:10]
+            start   = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+
+            bars = await loop.run_in_executor(
+                None, lambda: self.alpaca.get_bars(symbols, TimeFrame.Day, start)
+            )
+            if not bars:
+                await self._send(chat_id, "❌ No historical data returned from Alpaca.")
+                return
+
+            strategy = {
+                "entry_rules":      ["rsi_14 > 50", "rsi_14 < 70", "macd_histogram > 0"],
+                "exit_rules":       ["rsi_14 > 75", "macd_histogram < 0"],
+                "stop_loss_pct":    0.015,
+                "take_profit_pct":  0.03,
+                "position_size_pct": 0.10,
+            }
+
+            sym_pnl: dict[str, float] = {}
+            all_trades: list[dict]    = []
+            for sym, bar_list in bars.items():
+                if len(bar_list) < 30:
+                    continue
+                df     = self._bt_make_df(bar_list)
+                df     = self._bt_add_indicators(df)
+                trades = self._bt_simulate(df, strategy)
+                for t in trades:
+                    t["symbol"] = sym
+                all_trades.extend(trades)
+                sym_pnl[sym] = sum(t.get("pnl", 0) for t in trades if "pnl" in t)
+
+            completed = [t for t in all_trades if "exit_date" in t and "pnl" in t]
+            if not completed:
+                await self._send(chat_id,
+                    "⚠️ Backtest complete: no completed trades "
+                    "(market may need more bars for indicator warmup)."
+                )
+                return
+
+            total_pnl = sum(t["pnl"] for t in completed)
+            pnl_pcts  = [t["pnl_pct"] for t in completed]
+            win_rate  = sum(1 for p in pnl_pcts if p > 0) / len(pnl_pcts) * 100
+            best      = max(completed, key=lambda t: t["pnl"])
+            worst     = min(completed, key=lambda t: t["pnl"])
+            best_sym  = max(sym_pnl, key=sym_pnl.get) if sym_pnl else "?"
+            sign      = "+" if total_pnl >= 0 else ""
+
+            lines = [
+                "📊 <b>Backtest Results — Last 90 Days</b>",
+                f"Strategy: momentum + RSI + MACD  |  Symbols: {len(sym_pnl)}",
+                "",
+                f"Trades:      {len(completed)}",
+                f"Win rate:    {win_rate:.1f}%",
+                f"Total P&amp;L: {sign}${total_pnl:.2f}",
+                "",
+                f"Best:  {best['symbol']}  +${best['pnl']:.2f}  "
+                f"({best.get('entry_date','?')} → {best.get('exit_date','?')})",
+                f"Worst: {worst['symbol']}  ${worst['pnl']:.2f}  "
+                f"({worst.get('entry_date','?')} → {worst.get('exit_date','?')})",
+                f"Best stock:  {best_sym}  (${sym_pnl.get(best_sym, 0):.2f})",
+            ]
+            await self._send(chat_id, "\n".join(lines))
+
+        except Exception as e:
+            self.log(f"/backtest error: {e}", "error")
+            await self._send(chat_id, f"❌ Backtest failed: {e}")
+
+    async def _cmd_mocktest(self, chat_id: str):
+        """Simulate the last 7 trading days with paper trades (no real orders)."""
+        await self._send(chat_id,
+            "🎭 <b>Running mock market simulation...</b>\n"
+            "Simulating last 7 trading days with paper orders on top 5 symbols."
+        )
+        try:
+            loop    = asyncio.get_event_loop()
+            symbols = UniverseConfig.WATCHLIST[:5]
+            start   = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+
+            bars = await loop.run_in_executor(
+                None, lambda: self.alpaca.get_bars(symbols, TimeFrame.Day, start)
+            )
+            if not bars:
+                await self._send(chat_id, "❌ No historical data available.")
+                return
+
+            strategy = {
+                "entry_rules":       ["rsi_14 > 50", "rsi_14 < 70", "macd_histogram > 0"],
+                "exit_rules":        ["rsi_14 > 75", "macd_histogram < 0"],
+                "stop_loss_pct":     0.015,
+                "take_profit_pct":   0.03,
+                "position_size_pct": 0.20,
+            }
+
+            paper    = 10000.0
+            per_sym  = paper / max(len(bars), 1)
+            sym_results: dict[str, dict] = {}
+            all_trades: list[dict]       = []
+
+            for sym, bar_list in bars.items():
+                if len(bar_list) < 40:
+                    continue
+                df     = self._bt_make_df(bar_list)
+                df     = self._bt_add_indicators(df)
+                # Simulate full history; track only last 7 trading days
+                cutoff = str(df.index[-7].date()) if len(df) >= 7 else str(df.index[0].date())
+                trades = self._bt_simulate(df, strategy, initial_capital=per_sym)
+                recent = [t for t in trades if t.get("entry_date", "") >= cutoff]
+                for t in recent:
+                    t["symbol"] = sym
+                all_trades.extend(recent)
+                sym_pnl = sum(t.get("pnl", 0) for t in recent if "pnl" in t)
+                sym_results[sym] = {"trades": len(recent), "pnl": sym_pnl}
+
+            completed = [t for t in all_trades if "exit_date" in t and "pnl" in t]
+            total_pnl = sum(t["pnl"] for t in completed)
+            pnl_pcts  = [t["pnl_pct"] for t in completed]
+            win_rate  = sum(1 for p in pnl_pcts if p > 0) / len(pnl_pcts) * 100 if pnl_pcts else 0
+            sign      = "+" if total_pnl >= 0 else ""
+
+            lines = [
+                "🎭 <b>Mock Market Simulation — Last 7 Trading Days</b>",
+                f"Paper account: $10,000  |  Symbols: {', '.join(sym_results.keys())}",
+                "",
+            ]
+            for sym, res in sorted(sym_results.items(), key=lambda x: x[1]["pnl"], reverse=True):
+                s = "+" if res["pnl"] >= 0 else ""
+                lines.append(f"  {sym}: {res['trades']} trades  {s}${res['pnl']:.2f}")
+            lines += [
+                "",
+                f"Total fake trades:  {len(completed)}",
+                f"Win rate:           {win_rate:.1f}%",
+                f"Simulated P&amp;L:     {sign}${total_pnl:.2f}",
+                "",
+                "✅ Simulation complete — no real orders placed",
+            ]
+            if not completed:
+                lines.append("⚠️ No signals triggered in this 7-day window.")
+            await self._send(chat_id, "\n".join(lines))
+
+        except Exception as e:
+            self.log(f"/mocktest error: {e}", "error")
+            await self._send(chat_id, f"❌ Mock test failed: {e}")
+
+    async def _cmd_signaltest(self, chat_id: str):
+        """Verify that all five signal pipelines are actively flowing."""
+        await self._send(chat_id, "🔍 <b>Testing all signal pipelines...</b>")
+        results: list[str] = []
+        loop = asyncio.get_event_loop()
+
+        # 1. Momentum signals (bot03)
+        try:
+            mom = await self.bus.get_state("bot3:leaderboard") or {}
+            if mom:
+                leaders = mom.get("top_momentum") or mom.get("leaders") or []
+                count   = len(leaders) if isinstance(leaders, list) else len(mom)
+                results.append(f"✅ Momentum: {count} signals in leaderboard")
+            else:
+                results.append("⚠️ Momentum: no leaderboard data (bot03 not scanned yet?)")
+        except Exception as e:
+            results.append(f"❌ Momentum: {e}")
+
+        # 2. News sentiment (bot01)
+        try:
+            news = await self.bus.get_state("bot1:latest_summary") or {}
+            if news:
+                ts = news.get("timestamp", "")
+                results.append(f"✅ News: summary available (ts={ts[:16] if ts else '?'})")
+            else:
+                results.append("⚠️ News: no summary yet (bot01 loading or market closed?)")
+        except Exception as e:
+            results.append(f"❌ News: {e}")
+
+        # 3. Strategy setups (bot05)
+        try:
+            strat  = await self.bus.get_state("bot5:latest") or {}
+            if strat:
+                setups = strat.get("setups") or strat.get("trade_setups") or []
+                count  = len(setups) if isinstance(setups, list) else "n/a"
+                results.append(f"✅ Strategy: {count} setups generated")
+            else:
+                results.append("⚠️ Strategy: no setups yet (bot05 idle or market closed?)")
+        except Exception as e:
+            results.append(f"❌ Strategy: {e}")
+
+        # 4. Execution agent ready (bot07)
+        try:
+            ex = await self.bus.get_state("bot7:summary") or {}
+            if ex:
+                trades_today = ex.get("trades_today", "?")
+                results.append(f"✅ Execution: ready ({trades_today} trades today)")
+            else:
+                results.append("⚠️ Execution: no status (bot07 may be idle)")
+        except Exception as e:
+            results.append(f"❌ Execution: {e}")
+
+        # 5. Live price check — confirm prices are real, not stale cached values
+        try:
+            price = await loop.run_in_executor(
+                None, lambda: self.alpaca.get_live_price("SPY", "buy")
+            )
+            if price and 50 < price < 10000:
+                results.append(f"✅ Live prices: SPY=${price:.2f} (real-time from Alpaca)")
+            elif price:
+                results.append(f"⚠️ Live prices: SPY=${price:.2f} (unusual range — verify)")
+            else:
+                results.append("❌ Live prices: SPY unavailable (market closed or API issue?)")
+        except Exception as e:
+            results.append(f"❌ Live prices: {e}")
+
+        all_ok = all(r.startswith("✅") for r in results)
+        icon   = "✅" if all_ok else "⚠️"
+        lines  = [f"{icon} <b>Signal Test Results</b>", ""] + results
+        await self._send(chat_id, "\n".join(lines))
+
+    async def _cmd_healthcheck(self, chat_id: str):
+        """Full 10-point system diagnostic."""
+        await self._send(chat_id, "🏥 <b>Running full health check (10 checks)...</b>")
+        checks: list[tuple[str, str]] = []
+        loop = asyncio.get_event_loop()
+
+        # 1. Alpaca connection
+        try:
+            acct = await loop.run_in_executor(None, self.alpaca.get_account)
+            pv   = acct.get("portfolio_value", 0)
+            checks.append(("Alpaca API", f"✅  ${pv:,.0f} portfolio value"))
+        except Exception as e:
+            checks.append(("Alpaca API", f"❌  {str(e)[:60]}"))
+
+        # 2. Anthropic API key configured
+        key = AnthropicConfig.API_KEY
+        if key and len(key) > 10:
+            checks.append(("Anthropic API", f"✅  key configured ({key[:4]}...{key[-4:]})"))
+        else:
+            checks.append(("Anthropic API", "❌  ANTHROPIC_API_KEY not set"))
+
+        # 3. Redis connection
+        try:
+            await self.bus.get_state("_healthcheck_probe")
+            checks.append(("Redis", "✅  connected"))
+        except Exception as e:
+            checks.append(("Redis", f"❌  {e}"))
+
+        # Load dashboard once for checks 4, 9, 10
+        dash: dict = {}
+        try:
+            dash = await self.bus.get_state("bot8:dashboard") or {}
+        except Exception:
+            pass
+
+        # 4. All bots alive
+        bhealth = dash.get("bot_health", {})
+        if bhealth:
+            alive = sum(1 for s in bhealth.values() if s == "alive")
+            dead  = [n for n, s in bhealth.items() if s == "dead"]
+            total = len(bhealth)
+            if dead:
+                checks.append(("Bots alive", f"⚠️  {alive}/{total} — dead: {', '.join(dead)}"))
+            else:
+                checks.append(("Bots alive", f"✅  {alive}/{total} all alive"))
+        else:
+            checks.append(("Bots alive", "⚠️  dashboard unavailable (bot08 not running?)"))
+
+        # 5. Watchlist size
+        wl_size = len(UniverseConfig.WATCHLIST) + len(UniverseConfig.WATCHLIST_ETFS)
+        wl_icon = "✅" if wl_size >= 50 else "⚠️"
+        checks.append(("Watchlist size", (
+            f"{wl_icon}  {wl_size} symbols "
+            f"({len(UniverseConfig.WATCHLIST)} stocks + {len(UniverseConfig.WATCHLIST_ETFS)} ETFs)"
+        )))
+
+        # 6. Last momentum scan time
+        try:
+            mom = await self.bus.get_state("bot3:leaderboard") or {}
+            ts  = mom.get("timestamp", "")
+            if ts:
+                age  = (datetime.now(timezone.utc) -
+                        datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() / 60
+                icon = "✅" if age < 10 else "⚠️"
+                checks.append(("Momentum scan", f"{icon}  {age:.0f} min ago"))
+            else:
+                checks.append(("Momentum scan", "⚠️  no scan data (bot03 not running?)"))
+        except Exception:
+            checks.append(("Momentum scan", "⚠️  state unavailable"))
+
+        # 7. Last news scan time
+        try:
+            news = await self.bus.get_state("bot1:latest_summary") or {}
+            ts   = news.get("timestamp", "")
+            if ts:
+                age  = (datetime.now(timezone.utc) -
+                        datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() / 60
+                icon = "✅" if age < 60 else "⚠️"
+                checks.append(("News scan", f"{icon}  {age:.0f} min ago"))
+            else:
+                checks.append(("News scan", "⚠️  no news data (bot01 not running?)"))
+        except Exception:
+            checks.append(("News scan", "⚠️  state unavailable"))
+
+        # 8. Trading window status
+        et        = pytz.timezone(TradingWindowConfig.TIMEZONE)
+        now_et    = datetime.now(et)
+        t         = now_et.time()
+        open_t    = dt_time(*TradingWindowConfig.OPEN)
+        close_t   = dt_time(*TradingWindowConfig.CLOSE)
+        in_window = open_t <= t <= close_t
+        day_str   = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][now_et.weekday()]
+        if now_et.weekday() >= 5:
+            checks.append(("Trading window", f"🔴  Weekend ({day_str}) — market closed"))
+        elif in_window:
+            checks.append(("Trading window",
+                f"✅  OPEN ({now_et.strftime('%H:%M')} ET, {day_str})"))
+        else:
+            checks.append(("Trading window", (
+                f"🔴  CLOSED ({now_et.strftime('%H:%M')} ET — "
+                f"window {TradingWindowConfig.OPEN_STR}–{TradingWindowConfig.CLOSE_STR})"
+            )))
+
+        # 9. Current market regime
+        regime = dash.get("regime") or {}
+        if not regime:
+            try:
+                regime = await self.bus.get_state("bot8:regime") or {}
+            except Exception:
+                pass
+        if regime:
+            name  = regime.get("name", "?")
+            scale = regime.get("scale", 1.0)
+            checks.append(("Regime", f"✅  {name} (position scale={scale:.2f})"))
+        else:
+            checks.append(("Regime", "⚠️  no regime data"))
+
+        # 10. Circuit breaker status
+        cb = dash.get("circuit_breaker") or {}
+        if not cb:
+            try:
+                cb = await self.bus.get_state("bot8:cb_state") or {}
+            except Exception:
+                pass
+        if cb:
+            level  = cb.get("level", 0)
+            action = cb.get("action", "continue")
+            icon   = "✅" if level == 0 else ("⚠️" if level < 3 else "🔴")
+            checks.append(("Circuit breaker", f"{icon}  Level {level} — {action}"))
+        else:
+            checks.append(("Circuit breaker", "⚠️  no CB state"))
+
+        # Build report
+        lines = ["🏥 <b>Health Check Report</b>", ""]
+        for label, status in checks:
+            lines.append(f"<b>{label}:</b>  {status}")
+        pass_count = sum(1 for _, s in checks if s.startswith("✅"))
+        lines += ["", f"<b>Overall: {pass_count}/{len(checks)} checks passed</b>"]
+        await self._send(chat_id, "\n".join(lines))
+
+    # ── Backtest simulation helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _bt_make_df(bar_list: list[dict]) -> pd.DataFrame:
+        df = pd.DataFrame(bar_list)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.set_index("timestamp", inplace=True)
+        df.sort_index(inplace=True)
+        return df
+
+    @staticmethod
+    def _bt_add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        df    = df.copy()
+        delta = df["close"].diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rs    = gain / loss.replace(0, np.nan)
+        df["rsi_14"]         = 100 - (100 / (1 + rs))
+        ema12                = df["close"].ewm(span=12, adjust=False).mean()
+        ema26                = df["close"].ewm(span=26, adjust=False).mean()
+        df["macd"]           = ema12 - ema26
+        df["macd_signal"]    = df["macd"].ewm(span=9, adjust=False).mean()
+        df["macd_histogram"] = df["macd"] - df["macd_signal"]
+        df["sma_20"]         = df["close"].rolling(20).mean()
+        return df.dropna(subset=["rsi_14", "macd_histogram"])
+
+    @staticmethod
+    def _bt_eval_rule(row, rule: str) -> bool:
+        parts = rule.strip().split()
+        if len(parts) != 3:
+            return False
+        col, op, val = parts
+        lhs = row.get(col)
+        if lhs is None:
+            return False
+        rhs = float(val)
+        lhs = float(lhs)
+        if op == ">":  return lhs > rhs
+        if op == "<":  return lhs < rhs
+        if op == ">=": return lhs >= rhs
+        if op == "<=": return lhs <= rhs
+        return False
+
+    def _bt_simulate(self, df: pd.DataFrame, strategy: dict,
+                     initial_capital: float = 10000.0) -> list[dict]:
+        stop_pct    = strategy.get("stop_loss_pct", 0.015)
+        target_pct  = strategy.get("take_profit_pct", 0.03)
+        size_pct    = strategy.get("position_size_pct", 0.10)
+        entry_rules = strategy.get("entry_rules", [])
+        exit_rules  = strategy.get("exit_rules", [])
+        SLIP        = 0.0005   # 5 bps slippage
+
+        capital  = initial_capital
+        position = 0
+        entry_px = 0.0
+        trades: list[dict] = []
+        in_trade = False
+
+        rows = list(df.iterrows())
+        for i, (ts, row) in enumerate(rows):
+            price = float(row["close"])
+            if not in_trade:
+                if entry_rules and all(self._bt_eval_rule(row, r) for r in entry_rules):
+                    shares  = max(1, int(capital * size_pct / price))
+                    exec_px = price * (1 + SLIP)
+                    cost    = shares * exec_px
+                    if cost <= capital:
+                        capital   -= cost
+                        position   = shares
+                        entry_px   = exec_px
+                        in_trade   = True
+                        trades.append({
+                            "entry_date": str(ts.date()),
+                            "entry":      round(exec_px, 2),
+                            "shares":     shares,
+                        })
+            else:
+                pnl_pct  = (price - entry_px) / entry_px
+                exit_sig = (
+                    pnl_pct <= -stop_pct or
+                    pnl_pct >= target_pct or
+                    any(self._bt_eval_rule(row, r) for r in exit_rules) or
+                    i == len(rows) - 1
+                )
+                if exit_sig:
+                    exec_px  = price * (1 - SLIP)
+                    proceeds = position * exec_px
+                    capital += proceeds
+                    cost     = trades[-1]["shares"] * trades[-1]["entry"]
+                    pnl      = proceeds - cost
+                    trades[-1].update({
+                        "exit_date": str(ts.date()),
+                        "exit":      round(exec_px, 2),
+                        "pnl":       round(pnl, 2),
+                        "pnl_pct":   round(pnl / cost * 100, 2),
+                        "reason":    ("stop"   if pnl_pct <= -stop_pct else
+                                      "target" if pnl_pct >= target_pct else "signal"),
+                    })
+                    position = 0
+                    in_trade = False
+
+        return trades
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
