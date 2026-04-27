@@ -589,22 +589,27 @@ class TelegramController(BaseBot):
     async def _cmd_mocktest(self, chat_id: str):
         """
         Simulate last 5 trading days across all 55 watchlist symbols.
-        Logic: if a stock moved ≥1.5% open→close the bot would have caught it.
-        Profit/loss is calculated on a $2,000 position per trade.
+
+        Five filters applied in sequence:
+          1. SPY direction (BULL/BEAR/NEUTRAL) — controls which direction to trade
+          2. Momentum threshold — 2.0% open→close (grade A ≥ 3% for neutral days)
+          3. Volume confirmation — today's volume must be ≥ average daily volume
+          4. Sector alignment — stock direction must match its sector ETF
+          5. Intraday stop-loss — if low dipped ≤ −1.5% from open, bot was stopped out
         """
         await self._send(chat_id,
-            "🎭 <b>Running mock market simulation...</b>\n"
-            "Scanning all 55 symbols over the last 5 trading days."
+            "🎭 <b>Running mock market simulation (v2)...</b>\n"
+            "55 symbols · 5 days · direction + volume + sector filters"
         )
         try:
-            loop    = asyncio.get_event_loop()
+            loop = asyncio.get_event_loop()
+
+            # All 55 symbols + XLY (needed for sector alignment but not in WATCHLIST_ETFS)
             symbols = list(dict.fromkeys(
-                UniverseConfig.WATCHLIST + UniverseConfig.WATCHLIST_ETFS
+                UniverseConfig.WATCHLIST + UniverseConfig.WATCHLIST_ETFS + ["XLY"]
             ))
 
-            # Fetch ~14 calendar days to guarantee ≥5 complete trading days
             start = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%d")
-
             await self._send(chat_id, f"📥 Fetching daily bars for {len(symbols)} symbols…")
             bars = await loop.run_in_executor(
                 None, lambda: self.alpaca.get_bars(symbols, TimeFrame.Day, start)
@@ -613,10 +618,10 @@ class TelegramController(BaseBot):
                 await self._send(chat_id, "❌ No historical data returned from Alpaca.")
                 return
 
-            # ── Find the 5 most recent trading dates present in the data ──────
+            # ── Find 5 most recent complete trading dates ──────────────────────
             all_dates: set[str] = set()
-            for bar_list in bars.values():
-                for b in bar_list:
+            for bl in bars.values():
+                for b in bl:
                     d = (b.get("timestamp") or "")[:10]
                     if d:
                         all_dates.add(d)
@@ -625,44 +630,133 @@ class TelegramController(BaseBot):
                 await self._send(chat_id, "⚠️ No recent trading data found.")
                 return
 
-            # ── Simulation parameters ─────────────────────────────────────────
-            POSITION_USD      = 2000.0
-            MOMENTUM_PCT      = 1.5    # min % move open→close to count as caught
-            TAKE_PROFIT_PCT   = 3.0    # cap gain at +3% (take-profit level)
-            STOP_LOSS_PCT     = 1.5    # stop loss applied on losing days
+            # ── Build lookup tables ────────────────────────────────────────────
+            sym_date_bar: dict[str, dict[str, dict]] = {}
+            sym_avg_vol:  dict[str, float]           = {}
+            for sym, bl in bars.items():
+                date_map: dict[str, dict] = {}
+                vols: list[float] = []
+                for b in bl:
+                    d = (b.get("timestamp") or "")[:10]
+                    date_map[d] = b
+                    v = float(b.get("volume", 0) or 0)
+                    if v > 0:
+                        vols.append(v)
+                sym_date_bar[sym] = date_map
+                sym_avg_vol[sym]  = sum(vols) / len(vols) if vols else 0.0
 
-            # day_results: aggregate per trading date
+            # ── Sector reverse map: stock → sector ETF ─────────────────────────
+            stock_sector: dict[str, str] = {
+                stock: etf
+                for etf, members in UniverseConfig.SECTOR_ETFS.items()
+                for stock in members
+            }
+
+            # ── Simulation constants ───────────────────────────────────────────
+            POSITION_USD     = 2000.0
+            MOMENTUM_PCT     = 2.0   # min daily move to qualify as a signal
+            GRADE_A_PCT      = 3.0   # grade A = strong enough for neutral days
+            BULL_BEAR_THRESH = 0.3   # SPY ±0.3% separates BULL / BEAR / NEUTRAL
+            TAKE_PROFIT_PCT  = 3.0   # bot exits at +3%
+            STOP_LOSS_PCT    = 1.5   # stop exit at −1.5% from open
+            INVERSE_ETFS     = {"SQQQ", "SPXS", "SOXS"}
+            REGIME_ICON      = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "🟡"}
+
             day_results: dict[str, dict] = {
-                d: {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best_sym": "", "best_pct": 0.0}
+                d: {
+                    "trades": 0, "wins": 0, "losses": 0,
+                    "pnl": 0.0, "skipped": 0, "regime": "",
+                    "best_sym": "", "best_pct": 0.0,
+                }
                 for d in sorted_dates
             }
-            sym_pnl:   dict[str, float]              = {}
-            top_movers: list[tuple[str, str, float]] = []  # (sym, date, daily_pct)
+            sym_pnl:    dict[str, float]             = {}
+            top_movers: list[tuple[str, str, float]] = []
 
-            for sym, bar_list in bars.items():
-                date_bar: dict[str, dict] = {}
-                for b in bar_list:
-                    d = (b.get("timestamp") or "")[:10]
-                    if d in sorted_dates:
-                        date_bar[d] = b
+            for date in sorted_dates:
+                # ── Filter 1: market direction via SPY ────────────────────────
+                spy   = sym_date_bar.get("SPY", {}).get(date, {})
+                spy_o = float(spy.get("open",  0) or 0)
+                spy_c = float(spy.get("close", 0) or 0)
+                spy_pct = (spy_c - spy_o) / spy_o * 100 if spy_o > 0 else 0.0
 
-                sym_total = 0.0
-                for date in sorted_dates:
-                    b = date_bar.get(date)
-                    if not b:
+                if   spy_pct >  BULL_BEAR_THRESH: regime = "BULL"
+                elif spy_pct < -BULL_BEAR_THRESH: regime = "BEAR"
+                else:                              regime = "NEUTRAL"
+                day_results[date]["regime"] = regime
+
+                # Per-sector direction for this date
+                sector_pct: dict[str, float] = {}
+                for etf in UniverseConfig.SECTOR_ETFS:
+                    eb = sym_date_bar.get(etf, {}).get(date, {})
+                    eo = float(eb.get("open",  0) or 0)
+                    ec = float(eb.get("close", 0) or 0)
+                    sector_pct[etf] = (ec - eo) / eo * 100 if eo > 0 else 0.0
+
+                for sym in symbols:
+                    bar = sym_date_bar.get(sym, {}).get(date)
+                    if not bar:
                         continue
-                    open_p  = float(b.get("open",  0) or 0)
-                    close_p = float(b.get("close", 0) or 0)
+                    open_p  = float(bar.get("open",  0) or 0)
+                    close_p = float(bar.get("close", 0) or 0)
+                    high_p  = float(bar.get("high",  0) or 0)
+                    low_p   = float(bar.get("low",   0) or 0)
+                    volume  = float(bar.get("volume", 0) or 0)
                     if open_p <= 0:
                         continue
-                    daily_pct = (close_p - open_p) / open_p * 100
 
-                    if daily_pct >= MOMENTUM_PCT:
-                        # Upward momentum caught — profit capped at take-profit
-                        profit_pct = min(daily_pct, TAKE_PROFIT_PCT)
+                    daily_pct  = (close_p - open_p) / open_p * 100
+                    intra_low  = (low_p   - open_p) / open_p * 100
+                    intra_high = (high_p  - open_p) / open_p * 100
+                    is_inverse = sym in INVERSE_ETFS
+                    dr         = day_results[date]
+
+                    # Filter 1 cont.: regime-based direction gate
+                    if regime == "BULL":
+                        if is_inverse or daily_pct < 0:
+                            dr["skipped"] += 1
+                            continue
+                    elif regime == "BEAR":
+                        if not is_inverse or daily_pct < 0:
+                            dr["skipped"] += 1
+                            continue
+                    else:  # NEUTRAL: grade A positive moves only
+                        if daily_pct < GRADE_A_PCT:
+                            dr["skipped"] += 1
+                            continue
+
+                    # Filter 2: momentum threshold
+                    if daily_pct < MOMENTUM_PCT:
+                        dr["skipped"] += 1
+                        continue
+
+                    # Filter 3: volume must be at or above average
+                    avg_vol = sym_avg_vol.get(sym, 0)
+                    if avg_vol > 0 and volume < avg_vol:
+                        dr["skipped"] += 1
+                        continue
+
+                    # Filter 4: sector alignment (skip if sector moves opposite)
+                    sec_etf = stock_sector.get(sym)
+                    if sec_etf:
+                        sec_dir = sector_pct.get(sec_etf, 0)
+                        if (daily_pct > 0 and sec_dir < 0) or (daily_pct < 0 and sec_dir > 0):
+                            dr["skipped"] += 1
+                            continue
+
+                    # Filter 5 + trade outcome: intraday stop-loss check
+                    # If low dipped past stop before recovering → bot was filled at −1.5%
+                    if intra_low <= -STOP_LOSS_PCT:
+                        loss = round(POSITION_USD * STOP_LOSS_PCT / 100, 2)
+                        sym_pnl[sym] = sym_pnl.get(sym, 0.0) - loss
+                        dr["trades"] += 1
+                        dr["losses"] += 1
+                        dr["pnl"]    -= loss
+                    else:
+                        # Clean win: exit at take-profit if high reached it, else close
+                        profit_pct = TAKE_PROFIT_PCT if intra_high >= TAKE_PROFIT_PCT else daily_pct
                         profit     = round(POSITION_USD * profit_pct / 100, 2)
-                        sym_total += profit
-                        dr = day_results[date]
+                        sym_pnl[sym] = sym_pnl.get(sym, 0.0) + profit
                         dr["trades"] += 1
                         dr["wins"]   += 1
                         dr["pnl"]    += profit
@@ -671,35 +765,23 @@ class TelegramController(BaseBot):
                             dr["best_pct"] = daily_pct
                         top_movers.append((sym, date, daily_pct))
 
-                    elif daily_pct <= -MOMENTUM_PCT:
-                        # False-signal entry stopped out at stop-loss
-                        loss      = round(POSITION_USD * STOP_LOSS_PCT / 100, 2)
-                        sym_total -= loss
-                        dr = day_results[date]
-                        dr["trades"]  += 1
-                        dr["losses"]  += 1
-                        dr["pnl"]     -= loss
-
-                if sym_total != 0.0:
-                    sym_pnl[sym] = round(sym_total, 2)
-
-            # ── Aggregate totals ──────────────────────────────────────────────
-            total_trades = sum(d["trades"] for d in day_results.values())
-            total_wins   = sum(d["wins"]   for d in day_results.values())
-            total_losses = sum(d["losses"] for d in day_results.values())
-            total_pnl    = sum(d["pnl"]    for d in day_results.values())
+            # ── Aggregate ──────────────────────────────────────────────────────
+            total_trades = sum(d["trades"]  for d in day_results.values())
+            total_wins   = sum(d["wins"]    for d in day_results.values())
+            total_losses = sum(d["losses"]  for d in day_results.values())
+            total_pnl    = sum(d["pnl"]     for d in day_results.values())
+            total_skip   = sum(d["skipped"] for d in day_results.values())
             win_rate     = total_wins / total_trades * 100 if total_trades else 0.0
 
             top_movers.sort(key=lambda x: x[2], reverse=True)
-            top5 = top_movers[:5]
-            best_syms  = sorted(sym_pnl.items(), key=lambda x: x[1], reverse=True)[:5]
+            top5      = top_movers[:5]
+            best_syms = sorted(sym_pnl.items(), key=lambda x: x[1], reverse=True)[:5]
+            sign      = "+" if total_pnl >= 0 else ""
 
-            sign = "+" if total_pnl >= 0 else ""
-
-            # ── Build report ──────────────────────────────────────────────────
+            # ── Report ─────────────────────────────────────────────────────────
             lines = [
-                "🎭 <b>Mock Market Simulation — Last 5 Trading Days</b>",
-                f"Symbols scanned: {len(bars)} | Position size: $2,000/trade | Threshold: ±1.5%",
+                "🎭 <b>Mock Market Simulation v2 — Last 5 Trading Days</b>",
+                f"Symbols: {len(bars)} | $2,000/trade | SPY-direction · 2% threshold · volume · sector",
                 "",
                 "📅 <b>Day-by-day results:</b>",
             ]
@@ -707,10 +789,11 @@ class TelegramController(BaseBot):
                 dr   = day_results[date]
                 ds   = "+" if dr["pnl"] >= 0 else ""
                 icon = "🟢" if dr["pnl"] >= 0 else "🔴"
+                ri   = REGIME_ICON.get(dr["regime"], "⬜")
                 best = f"  (best: {dr['best_sym']} +{dr['best_pct']:.1f}%)" if dr["best_sym"] else ""
                 lines.append(
-                    f"{icon} {date}:  {dr['trades']} trades, "
-                    f"{dr['wins']}W/{dr['losses']}L, "
+                    f"{icon} {date} [{ri} {dr['regime']}]:  "
+                    f"{dr['trades']} trades, {dr['wins']}W/{dr['losses']}L, "
                     f"{ds}${dr['pnl']:.0f}{best}"
                 )
 
@@ -719,6 +802,7 @@ class TelegramController(BaseBot):
                 "📊 <b>Overall summary:</b>",
                 f"Total trades:    {total_trades}  ({total_wins}W / {total_losses}L)",
                 f"Win rate:        {win_rate:.1f}%",
+                f"Signals skipped: {total_skip}  (failed direction/volume/sector filters)",
                 f"Estimated P&amp;L: {sign}${total_pnl:.2f}",
             ]
 
@@ -729,7 +813,7 @@ class TelegramController(BaseBot):
                     lines.append(f"  {sym} ({date}): +{pct:.1f}%  →  +${profit:.0f}")
 
             if best_syms:
-                lines += ["", "🏆 <b>Best-performing symbols:</b>"]
+                lines += ["", "🏆 <b>Best symbols this week:</b>"]
                 for sym, pnl in best_syms:
                     s = "+" if pnl >= 0 else ""
                     lines.append(f"  {sym}: {s}${pnl:.2f}")
