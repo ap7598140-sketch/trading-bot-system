@@ -654,7 +654,8 @@ class TelegramController(BaseBot):
 
             # ── Simulation constants ───────────────────────────────────────────
             POSITION_USD     = 2000.0
-            MOMENTUM_PCT     = 2.0   # min daily move to qualify as a signal
+            MOMENTUM_PCT      = 2.0   # min move on NEUTRAL / BEAR days
+            BULL_MOMENTUM_PCT = 1.8   # lower threshold on confirmed BULL days
             GRADE_A_PCT      = 3.0   # grade A = strong enough for neutral days
             BULL_BEAR_THRESH = 0.3   # SPY ±0.3% separates BULL / BEAR / NEUTRAL
             TAKE_PROFIT_PCT  = 3.0   # bot exits at +3%
@@ -725,8 +726,9 @@ class TelegramController(BaseBot):
                             dr["skipped"] += 1
                             continue
 
-                    # Filter 2: momentum threshold
-                    if daily_pct < MOMENTUM_PCT:
+                    # Filter 2: momentum threshold (relaxed to 1.8% on bull days)
+                    threshold = BULL_MOMENTUM_PCT if regime == "BULL" else MOMENTUM_PCT
+                    if daily_pct < threshold:
                         dr["skipped"] += 1
                         continue
 
