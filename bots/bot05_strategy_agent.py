@@ -784,13 +784,12 @@ class StrategyAgent(BaseBot):
             self.log("New trades blocked (circuit breaker or market gate). Skipping cycle.", "warning")
             return
 
-        # Time window: only trade 9:45-10:30am and 2:00-3:00pm EST
+        # Time window: only trade during the configured all-day window
         if not self._in_trading_window():
-            from datetime import time as dt_time
             t = datetime.now(MARKET_TZ).time()
             self.log(
                 f"Outside trading window ({t.strftime('%H:%M')} ET) — "
-                f"windows: 9:45-10:30am, 2:00-3:00pm. Skipping."
+                f"window: {TradingWindowConfig.OPEN_STR}–{TradingWindowConfig.CLOSE_STR}. Skipping."
             )
             return
 
