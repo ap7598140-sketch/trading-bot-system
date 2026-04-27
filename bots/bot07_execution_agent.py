@@ -40,9 +40,11 @@ class ExecutionAgent(BaseBot):
         self.client = anthropic.Anthropic(api_key=AnthropicConfig.API_KEY)
         self.alpaca = AlpacaClient()
 
-        self._trading_halted = False
-        self._no_new_buys   = False   # True after 3:50pm — blocks new buy orders only
-        self._trades_today  = 0       # resets at market open; capped at MAX_DAILY_TRADES
+        self._trading_halted         = False
+        self._no_new_buys            = False   # True after 3:50pm — blocks new buy orders only
+        self._profit_locked          = False   # True when +$50 daily profit target hit
+        self._trades_today           = 0       # resets at market open; capped at MAX_DAILY_TRADES
+        self._slow_start_trade_count = 0       # trades placed in first 30 min (9:35–10:05am ET)
         self._pending_orders: dict[str, dict] = {}    # order_id → order info
         self._executions_today: list[dict] = []
         # Position tracker for partial-close / trailing-stop / compound logic
@@ -95,6 +97,17 @@ class ExecutionAgent(BaseBot):
             })
             return
 
+        if event_type == "halt_new_trades":
+            self._profit_locked = True
+            self.log(f"New trades locked: {event.get('reason')}", "warning")
+            return
+
+        if event_type == "resume_trading":
+            self._trading_halted = False
+            self._profit_locked  = False
+            self.log(f"Trading resumed: {event.get('reason')}")
+            return
+
         if self._trading_halted and event_type not in ("force_close", "take_profit"):
             self.log(f"Trading halted – ignoring {event_type} for {event.get('symbol')}", "warning")
             return
@@ -105,6 +118,16 @@ class ExecutionAgent(BaseBot):
             await self._force_close(event.get("symbol"), event.get("reason", ""))
         elif event_type == "take_profit":
             await self._close_position(event.get("symbol"), "take_profit")
+
+    # ── Slow-start window check ────────────────────────────────────────────────
+
+    def _in_slow_start(self) -> bool:
+        """True during the first 30 min of the trading window (9:35–10:05am ET)."""
+        now_et   = datetime.now(MARKET_TZ).time()
+        open_h, open_m = TradingWindowConfig.OPEN
+        total    = open_h * 60 + open_m + 30   # 9*60+35+30 = 605 → 10:05am
+        slow_end = dt_time(total // 60, total % 60)
+        return dt_time(*TradingWindowConfig.OPEN) <= now_et < slow_end
 
     # ── Trade execution ────────────────────────────────────────────────────────
 
@@ -152,6 +175,28 @@ class ExecutionAgent(BaseBot):
         if self._no_new_buys and side == "buy":
             self.log(f"SKIPPED {sym}: no new buys after 3:50pm EST", "warning")
             return
+
+        # Profit lock — daily +$50 target hit, no new positions
+        if self._profit_locked and side == "buy":
+            self.log(f"SKIPPED {sym}: daily profit target locked ($50+) — no new positions", "warning")
+            return
+
+        # Slow start rule — grade A only, max 2 trades in first 30 min after open
+        if side == "buy" and self._in_slow_start():
+            grade = setup.get("grade", "")
+            if self._slow_start_trade_count >= 2:
+                self.log(
+                    f"SKIPPED {sym}: slow-start limit reached "
+                    f"({self._slow_start_trade_count}/2 trades in first 30 min)",
+                    "warning",
+                )
+                return
+            if grade not in ("A", "A+"):
+                self.log(
+                    f"SKIPPED {sym}: slow-start requires grade A signal (got '{grade}')",
+                    "warning",
+                )
+                return
 
         # Daily trade limit
         if self._trades_today >= RiskConfig.MAX_DAILY_TRADES:
@@ -273,6 +318,8 @@ class ExecutionAgent(BaseBot):
 
             self._executions_today.append(execution_record)
             self._trades_today += 1
+            if side == "buy" and self._in_slow_start():
+                self._slow_start_trade_count += 1
             if result.get("id"):
                 self._pending_orders[result["id"]] = execution_record
 
@@ -585,8 +632,10 @@ class ExecutionAgent(BaseBot):
             while next_open.weekday() >= 5:
                 next_open += timedelta(days=1)
             await asyncio.sleep((next_open - datetime.now(MARKET_TZ)).total_seconds())
-            self._no_new_buys  = False
-            self._trades_today = 0
+            self._no_new_buys            = False
+            self._trades_today           = 0
+            self._profit_locked          = False
+            self._slow_start_trade_count = 0
             self.log("Market open — buy orders re-enabled, daily trade counter reset")
 
     # ── EOD order cancel ───────────────────────────────────────────────────────
@@ -644,10 +693,13 @@ class ExecutionAgent(BaseBot):
 
     async def _report_summary(self):
         await self.save_state("summary", {
-            "executions_today": len(self._executions_today),
-            "pending_orders":   len(self._pending_orders),
-            "trading_halted":   self._trading_halted,
-            "timestamp":        datetime.utcnow().isoformat(),
+            "executions_today":       len(self._executions_today),
+            "pending_orders":         len(self._pending_orders),
+            "trading_halted":         self._trading_halted,
+            "profit_locked":          self._profit_locked,
+            "slow_start_trade_count": self._slow_start_trade_count,
+            "in_slow_start":          self._in_slow_start(),
+            "timestamp":              datetime.utcnow().isoformat(),
         }, ttl=120)
 
 

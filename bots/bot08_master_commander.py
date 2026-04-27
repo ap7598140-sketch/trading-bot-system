@@ -101,6 +101,7 @@ class MasterCommander(BaseBot):
         self._wins_today          = 0    # positions closed at take-profit
         self._losses_today        = 0    # positions closed at stop-loss
         self._milestone_sent: set[str] = set()  # tracks which daily milestones have been alerted
+        self._profit_locked     = False   # True when +$50 daily profit target hit
 
         # Aggregated signals
         self._risk_stats:      dict = {}
@@ -458,9 +459,9 @@ class MasterCommander(BaseBot):
 
         milestones = [
             ("p25",  25,  False, "💪 <b>+$25 milestone!</b> Good start — stay disciplined."),
-            ("p50",  50,  False, "🎯 <b>+$50 milestone!</b> Halfway to the daily target."),
-            ("p75",  75,  False, "🔥 <b>+$75 milestone!</b> Getting close — protect the gains!"),
-            ("p100", 100, False, "✅ <b>Daily $100 target HIT!</b> Locking in gains — no new trades."),
+            ("p50",  50,  False, "🔒 <b>Daily profit target hit! +$50</b> Locking in gains — no new trades today."),
+            ("p75",  75,  False, "🔥 <b>+$75 profit!</b> Existing positions running — no new entries."),
+            ("p100", 100, False, "✅ <b>+$100 profit — full halt.</b> All trading stopped for today."),
             ("n75",  -75, True,  "⚠️ <b>-$75 drawdown warning.</b> Tighten risk — review positions."),
             ("n150", -150, True, "🛑 <b>-$150 daily loss limit hit.</b> All trading HALTED for today."),
         ]
@@ -479,10 +480,13 @@ class MasterCommander(BaseBot):
             )
             self.log(f"Milestone {key}: pnl=${pnl:.2f}")
 
-            if key == "p100":
+            if key == "p50":
+                self._profit_locked = True
                 await self._publish_halt_new_trades(
-                    "Daily $100 profit target hit — locking in gains, no new trades"
+                    "Daily +$50 profit target hit — locking in gains, no new trades"
                 )
+            elif key == "p100":
+                await self._emergency_halt("Daily +$100 profit — full halt for today")
             elif key == "n150":
                 await self._emergency_halt("Daily -$150 loss limit hit — trading halted for today")
 
@@ -994,6 +998,7 @@ class MasterCommander(BaseBot):
             "timestamp":       datetime.utcnow().isoformat(),
             "market_session":  self._market_session,
             "system_halted":   self._system_halted,
+            "profit_locked":   self._profit_locked,
             "portfolio_value": self._portfolio_value,
             "daily_pnl":       self._daily_pnl,
             "daily_pnl_pct":   round(self._daily_pnl / self._session_start_val * 100, 2)
@@ -1116,6 +1121,7 @@ class MasterCommander(BaseBot):
                 self._consecutive_losses  = 0
                 self._wins_today          = 0
                 self._losses_today        = 0
+                self._profit_locked       = False
                 self._milestone_sent.clear()   # reset daily profit milestones
                 # Ensure gate is open at market open
                 await self.save_state("market_gate", {

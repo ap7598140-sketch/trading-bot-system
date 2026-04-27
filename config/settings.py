@@ -85,7 +85,8 @@ class RiskConfig:
     # ── Daily caps ────────────────────────────────────────────────────────────
     MAX_TRADE_LOSS_USD       = 75.0    # max loss per individual trade
     DAILY_LOSS_LIMIT_USD     = 150.0   # halt all trading at -$150/day
-    DAILY_PROFIT_TARGET_USD  = 100.0   # stop new trades at +$100/day (lock it in)
+    DAILY_PROFIT_LOCK_USD    = 50.0    # lock new trades at +$50/day (protect gains)
+    DAILY_PROFIT_TARGET_USD  = 100.0   # full halt at +$100/day
 
     # ── Signal quality ────────────────────────────────────────────────────────
     MIN_STOCK_SCORE          = 70      # premarket score required (1-100)
