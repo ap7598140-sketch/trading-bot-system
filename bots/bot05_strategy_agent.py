@@ -25,7 +25,7 @@ from shared.llm_router import LLMRouter
 MARKET_TZ = pytz.timezone("America/New_York")
 
 
-DECISION_DEBOUNCE = 600  # min seconds between decision cycles (10 min)
+DECISION_DEBOUNCE = 120  # min seconds between event-driven decision cycles (2 min)
 
 
 class StrategyAgent(BaseBot):
@@ -81,9 +81,22 @@ class StrategyAgent(BaseBot):
         )
 
     async def run(self):
-        # Keep alive; decisions fire event-driven from _on_market_data
+        # Periodic fallback: if pub/sub goes silent, force a cycle every scan interval.
+        # Event-driven triggers (momentum/market-data) run independently via debounce.
         while self.running:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(UniverseConfig.SCAN_INTERVAL_SECONDS)
+            now  = datetime.now(timezone.utc)
+            last = self._last_decision
+            silent_secs = (now - last).total_seconds() if last else 9999
+            if silent_secs >= UniverseConfig.SCAN_INTERVAL_SECONDS * 2:
+                self.log(
+                    f"Periodic fallback: no cycle in {silent_secs:.0f}s — "
+                    "forcing decision cycle (pub/sub may be stale)"
+                )
+                try:
+                    await self._decision_cycle()
+                except Exception as e:
+                    self.log(f"Periodic decision cycle error: {e}", "error")
 
     async def cleanup(self):
         self.log("Strategy Agent stopped")
@@ -812,26 +825,29 @@ class StrategyAgent(BaseBot):
         except Exception:
             pass
 
-        # Filter momentum signals: Grade A/B only, and from daily watchlist if available
+        # Grade A/B filter only — watchlist is a SOFT preference for Sonnet, not a hard gate.
+        # Previously the watchlist was used as a hard filter here, silently dropping every
+        # signal for symbols outside the 10-symbol top_10_active list.  That was the
+        # primary cause of momentum=0/N even when bot03 had just published fresh signals.
         _ALLOWED_GRADES = {"A", "A+", "B", ""}
         filtered_momentum = [
             m for m in self._momentum_signals
-            if (not m.get("grade") or m.get("grade") in _ALLOWED_GRADES)
-            and (not self._daily_watchlist or m.get("symbol") in self._daily_watchlist
-                 or m.get("symbol") in UniverseConfig.BEAR_ETFS)
+            if not m.get("grade") or m.get("grade") in _ALLOWED_GRADES
         ]
 
         signals = self._aggregate_signals()
-        # Replace momentum with grade/watchlist-filtered version
+        # Sort by score; watchlist symbols float to top via score boost
+        in_wl = set(self._daily_watchlist)
         signals["momentum"] = sorted(
             [s for s in filtered_momentum if s.get("direction") != "neutral"],
-            key=lambda x: x.get("score") or 0.5,
+            key=lambda x: (1 if x.get("symbol") in in_wl else 0,
+                           x.get("score") or 0.5),
             reverse=True,
         )[:10]
 
         self.log(
             f"Decision cycle | regime={self._current_regime} | window=OK | "
-            f"momentum={len(filtered_momentum)}/{len(self._momentum_signals)} (A/B grade) | "
+            f"momentum={len(signals['momentum'])}/{len(self._momentum_signals)} sent-to-Sonnet | "
             f"news={len(self._news_signals)} | watchlist={self._daily_watchlist[:5]}"
         )
 

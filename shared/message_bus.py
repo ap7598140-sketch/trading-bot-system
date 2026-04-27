@@ -90,30 +90,47 @@ class MessageBus:
         """
         Listen on all subscribed channels using the dedicated pubsub connection
         created in connect().  Only one coroutine ever reads from this socket.
+
+        Auto-recovers on connection errors so a transient Redis blip does not
+        permanently silence a bot.  Only asyncio.CancelledError stops the loop.
         """
         if not self._pubsub or not self._subscriptions:
             return
 
         channels = list(self._subscriptions.keys())
-        await self._pubsub.subscribe(*channels)
-        logger.info(f"MessageBus listening on: {channels}")
 
-        try:
-            async for message in self._pubsub.listen():
-                if message["type"] != "message":
-                    continue
-                channel = message["channel"]
-                try:
-                    data = json.loads(message["data"])
-                except json.JSONDecodeError:
-                    data = message["data"]
-                for handler in self._subscriptions.get(channel, []):
+        while True:
+            try:
+                await self._pubsub.subscribe(*channels)
+                logger.info(f"MessageBus listening on: {channels}")
+
+                async for message in self._pubsub.listen():
+                    if message["type"] != "message":
+                        continue
+                    channel = message["channel"]
                     try:
-                        await handler(data)
-                    except Exception as e:
-                        logger.error(f"Handler error on {channel}: {e}")
-        except asyncio.CancelledError:
-            pass
+                        data = json.loads(message["data"])
+                    except json.JSONDecodeError:
+                        data = message["data"]
+                    for handler in self._subscriptions.get(channel, []):
+                        try:
+                            await handler(data)
+                        except Exception as e:
+                            logger.error(f"Handler error on {channel}: {e}")
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(
+                    f"MessageBus listen() error: {e} — "
+                    f"pub/sub dropped, reconnecting in 5s (channels={channels})"
+                )
+                await asyncio.sleep(5)
+                # Unsubscribe before re-subscribing so Redis clears the old state
+                try:
+                    await self._pubsub.unsubscribe(*channels)
+                except Exception:
+                    pass
 
     # ── State ──────────────────────────────────────────────────────────────────
 
