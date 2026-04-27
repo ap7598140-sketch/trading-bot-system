@@ -587,75 +587,154 @@ class TelegramController(BaseBot):
             await self._send(chat_id, f"❌ Backtest failed: {e}")
 
     async def _cmd_mocktest(self, chat_id: str):
-        """Simulate the last 7 trading days with paper trades (no real orders)."""
+        """
+        Simulate last 5 trading days across all 55 watchlist symbols.
+        Logic: if a stock moved ≥1.5% open→close the bot would have caught it.
+        Profit/loss is calculated on a $2,000 position per trade.
+        """
         await self._send(chat_id,
             "🎭 <b>Running mock market simulation...</b>\n"
-            "Simulating last 7 trading days with paper orders on top 5 symbols."
+            "Scanning all 55 symbols over the last 5 trading days."
         )
         try:
             loop    = asyncio.get_event_loop()
-            symbols = UniverseConfig.WATCHLIST[:5]
-            start   = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+            symbols = list(dict.fromkeys(
+                UniverseConfig.WATCHLIST + UniverseConfig.WATCHLIST_ETFS
+            ))
 
+            # Fetch ~14 calendar days to guarantee ≥5 complete trading days
+            start = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%d")
+
+            await self._send(chat_id, f"📥 Fetching daily bars for {len(symbols)} symbols…")
             bars = await loop.run_in_executor(
                 None, lambda: self.alpaca.get_bars(symbols, TimeFrame.Day, start)
             )
             if not bars:
-                await self._send(chat_id, "❌ No historical data available.")
+                await self._send(chat_id, "❌ No historical data returned from Alpaca.")
                 return
 
-            strategy = {
-                "entry_rules":       ["rsi_14 > 50", "rsi_14 < 70", "macd_histogram > 0"],
-                "exit_rules":        ["rsi_14 > 75", "macd_histogram < 0"],
-                "stop_loss_pct":     0.015,
-                "take_profit_pct":   0.03,
-                "position_size_pct": 0.20,
-            }
+            # ── Find the 5 most recent trading dates present in the data ──────
+            all_dates: set[str] = set()
+            for bar_list in bars.values():
+                for b in bar_list:
+                    d = (b.get("timestamp") or "")[:10]
+                    if d:
+                        all_dates.add(d)
+            sorted_dates = sorted(all_dates)[-5:]
+            if not sorted_dates:
+                await self._send(chat_id, "⚠️ No recent trading data found.")
+                return
 
-            paper    = 10000.0
-            per_sym  = paper / max(len(bars), 1)
-            sym_results: dict[str, dict] = {}
-            all_trades: list[dict]       = []
+            # ── Simulation parameters ─────────────────────────────────────────
+            POSITION_USD      = 2000.0
+            MOMENTUM_PCT      = 1.5    # min % move open→close to count as caught
+            TAKE_PROFIT_PCT   = 3.0    # cap gain at +3% (take-profit level)
+            STOP_LOSS_PCT     = 1.5    # stop loss applied on losing days
+
+            # day_results: aggregate per trading date
+            day_results: dict[str, dict] = {
+                d: {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best_sym": "", "best_pct": 0.0}
+                for d in sorted_dates
+            }
+            sym_pnl:   dict[str, float]              = {}
+            top_movers: list[tuple[str, str, float]] = []  # (sym, date, daily_pct)
 
             for sym, bar_list in bars.items():
-                if len(bar_list) < 40:
-                    continue
-                df     = self._bt_make_df(bar_list)
-                df     = self._bt_add_indicators(df)
-                # Simulate full history; track only last 7 trading days
-                cutoff = str(df.index[-7].date()) if len(df) >= 7 else str(df.index[0].date())
-                trades = self._bt_simulate(df, strategy, initial_capital=per_sym)
-                recent = [t for t in trades if t.get("entry_date", "") >= cutoff]
-                for t in recent:
-                    t["symbol"] = sym
-                all_trades.extend(recent)
-                sym_pnl = sum(t.get("pnl", 0) for t in recent if "pnl" in t)
-                sym_results[sym] = {"trades": len(recent), "pnl": sym_pnl}
+                date_bar: dict[str, dict] = {}
+                for b in bar_list:
+                    d = (b.get("timestamp") or "")[:10]
+                    if d in sorted_dates:
+                        date_bar[d] = b
 
-            completed = [t for t in all_trades if "exit_date" in t and "pnl" in t]
-            total_pnl = sum(t["pnl"] for t in completed)
-            pnl_pcts  = [t["pnl_pct"] for t in completed]
-            win_rate  = sum(1 for p in pnl_pcts if p > 0) / len(pnl_pcts) * 100 if pnl_pcts else 0
-            sign      = "+" if total_pnl >= 0 else ""
+                sym_total = 0.0
+                for date in sorted_dates:
+                    b = date_bar.get(date)
+                    if not b:
+                        continue
+                    open_p  = float(b.get("open",  0) or 0)
+                    close_p = float(b.get("close", 0) or 0)
+                    if open_p <= 0:
+                        continue
+                    daily_pct = (close_p - open_p) / open_p * 100
 
+                    if daily_pct >= MOMENTUM_PCT:
+                        # Upward momentum caught — profit capped at take-profit
+                        profit_pct = min(daily_pct, TAKE_PROFIT_PCT)
+                        profit     = round(POSITION_USD * profit_pct / 100, 2)
+                        sym_total += profit
+                        dr = day_results[date]
+                        dr["trades"] += 1
+                        dr["wins"]   += 1
+                        dr["pnl"]    += profit
+                        if daily_pct > dr["best_pct"]:
+                            dr["best_sym"] = sym
+                            dr["best_pct"] = daily_pct
+                        top_movers.append((sym, date, daily_pct))
+
+                    elif daily_pct <= -MOMENTUM_PCT:
+                        # False-signal entry stopped out at stop-loss
+                        loss      = round(POSITION_USD * STOP_LOSS_PCT / 100, 2)
+                        sym_total -= loss
+                        dr = day_results[date]
+                        dr["trades"]  += 1
+                        dr["losses"]  += 1
+                        dr["pnl"]     -= loss
+
+                if sym_total != 0.0:
+                    sym_pnl[sym] = round(sym_total, 2)
+
+            # ── Aggregate totals ──────────────────────────────────────────────
+            total_trades = sum(d["trades"] for d in day_results.values())
+            total_wins   = sum(d["wins"]   for d in day_results.values())
+            total_losses = sum(d["losses"] for d in day_results.values())
+            total_pnl    = sum(d["pnl"]    for d in day_results.values())
+            win_rate     = total_wins / total_trades * 100 if total_trades else 0.0
+
+            top_movers.sort(key=lambda x: x[2], reverse=True)
+            top5 = top_movers[:5]
+            best_syms  = sorted(sym_pnl.items(), key=lambda x: x[1], reverse=True)[:5]
+
+            sign = "+" if total_pnl >= 0 else ""
+
+            # ── Build report ──────────────────────────────────────────────────
             lines = [
-                "🎭 <b>Mock Market Simulation — Last 7 Trading Days</b>",
-                f"Paper account: $10,000  |  Symbols: {', '.join(sym_results.keys())}",
+                "🎭 <b>Mock Market Simulation — Last 5 Trading Days</b>",
+                f"Symbols scanned: {len(bars)} | Position size: $2,000/trade | Threshold: ±1.5%",
                 "",
+                "📅 <b>Day-by-day results:</b>",
             ]
-            for sym, res in sorted(sym_results.items(), key=lambda x: x[1]["pnl"], reverse=True):
-                s = "+" if res["pnl"] >= 0 else ""
-                lines.append(f"  {sym}: {res['trades']} trades  {s}${res['pnl']:.2f}")
+            for date in sorted_dates:
+                dr   = day_results[date]
+                ds   = "+" if dr["pnl"] >= 0 else ""
+                icon = "🟢" if dr["pnl"] >= 0 else "🔴"
+                best = f"  (best: {dr['best_sym']} +{dr['best_pct']:.1f}%)" if dr["best_sym"] else ""
+                lines.append(
+                    f"{icon} {date}:  {dr['trades']} trades, "
+                    f"{dr['wins']}W/{dr['losses']}L, "
+                    f"{ds}${dr['pnl']:.0f}{best}"
+                )
+
             lines += [
                 "",
-                f"Total fake trades:  {len(completed)}",
-                f"Win rate:           {win_rate:.1f}%",
-                f"Simulated P&amp;L:     {sign}${total_pnl:.2f}",
-                "",
-                "✅ Simulation complete — no real orders placed",
+                "📊 <b>Overall summary:</b>",
+                f"Total trades:    {total_trades}  ({total_wins}W / {total_losses}L)",
+                f"Win rate:        {win_rate:.1f}%",
+                f"Estimated P&amp;L: {sign}${total_pnl:.2f}",
             ]
-            if not completed:
-                lines.append("⚠️ No signals triggered in this 7-day window.")
+
+            if top5:
+                lines += ["", "🚀 <b>Top momentum moves caught:</b>"]
+                for sym, date, pct in top5:
+                    profit = POSITION_USD * min(pct, TAKE_PROFIT_PCT) / 100
+                    lines.append(f"  {sym} ({date}): +{pct:.1f}%  →  +${profit:.0f}")
+
+            if best_syms:
+                lines += ["", "🏆 <b>Best-performing symbols:</b>"]
+                for sym, pnl in best_syms:
+                    s = "+" if pnl >= 0 else ""
+                    lines.append(f"  {sym}: {s}${pnl:.2f}")
+
+            lines.append("\n✅ Simulation complete — no real orders placed")
             await self._send(chat_id, "\n".join(lines))
 
         except Exception as e:
