@@ -61,6 +61,7 @@ class StrategyAgent(BaseBot):
         self._current_regime: str            = "neutral"  # from bot08 regime state
         self._premarket_scores: dict[str, int] = {}       # symbol → 1-100 score from bot04
         self._daily_watchlist: list[str]     = []         # top 10 active from bot04 daily scan
+        self._ai_consecutive_failures: int   = 0         # consecutive Sonnet JSON parse failures
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -171,6 +172,7 @@ class StrategyAgent(BaseBot):
             await asyncio.sleep((target - now_et).total_seconds())
             if datetime.now(MARKET_TZ).weekday() >= 5:
                 continue
+            self._ai_consecutive_failures = 0   # re-enable Claude each morning
             await self._check_sector_strength()
 
     async def _check_sector_strength(self):
@@ -556,10 +558,18 @@ class StrategyAgent(BaseBot):
 
     async def _generate_trade_setups(self, signals: dict) -> list[dict]:
         """Use Sonnet with full signal context to synthesise trade setups.
-        Never cached — every call is fresh so prices are always current."""
+        Never cached — every call is fresh so prices are always current.
+        Never freezes: 10 s timeout + consecutive-failure bypass after 3 failures."""
 
-        MAX_POS = RiskConfig.MAX_SINGLE_POSITION_USD
         sl_pct, tp_pct = self._regime_sl_tp()
+
+        # After 3 consecutive parse failures skip Claude — go straight to fallback
+        if self._ai_consecutive_failures >= 3:
+            self.log(
+                f"Strategy AI bypassed: {self._ai_consecutive_failures} consecutive parse failures "
+                "— using momentum fallback to protect trading cycle", "warning"
+            )
+            return self._momentum_fallback_setups(), "neutral", "ai_bypassed_consecutive_failures"
 
         sector_tag = f"sector={self._strongest_sector}" if self._strongest_sector else ""
         regime_tag = f"regime={self._current_regime} scale={self._regime_scale:.0%} cb={self._cb_scale:.0%}"
@@ -572,6 +582,8 @@ class StrategyAgent(BaseBot):
         # Pass full signal context — Claude needs the actual price to generate a
         # valid entry_price. Never compress: stripping price_context caused stale prices.
         prompt = (
+            "Return ONLY raw JSON. No markdown. No backticks. No headers. No explanation.\n"
+            "Start your response with { and end with }.\n\n"
             f"You are an expert intraday trader. Analyse the signals below and output 1-3 high-conviction trade setups.\n"
             f"Rules:\n"
             f"  - Only Grade A (${RiskConfig.GRADE_A_POSITION_USD:,.0f} position) or Grade B (${RiskConfig.GRADE_B_POSITION_USD:,.0f} position) signals\n"
@@ -584,7 +596,7 @@ class StrategyAgent(BaseBot):
             + f"  - {regime_tag}\n"
             + (f"  - {bear_note}\n" if bear_note else "")
             + f"\nFull market signals:\n{LLMRouter.j(signals)}\n\n"
-            "Respond ONLY with valid JSON (no markdown, no explanation):\n"
+            "Required JSON format (fill in real values, start with {, end with }):\n"
             "{\"setups\":[{\"symbol\":\"TICKER\",\"direction\":\"long\","
             "\"entry_price\":0.0,\"confidence\":0.85,\"grade\":\"A\","
             "\"timeframe\":\"intraday\",\"thesis\":\"one sentence why\","
@@ -597,19 +609,28 @@ class StrategyAgent(BaseBot):
             [{"role": "user", "content": prompt}],
             prefer="sonnet",
             max_tokens=800,
+            timeout=10.0,
         )
         if not raw:
-            return [], "neutral", ""
+            self._ai_consecutive_failures += 1
+            self.log(
+                f"Strategy AI empty/timeout (failure #{self._ai_consecutive_failures}) "
+                "— using momentum fallback", "warning"
+            )
+            return self._momentum_fallback_setups(), "neutral", "ai_timeout_momentum_fallback"
 
         parsed = self._parse_json_safe(raw)
 
         # ── Retry with a strict prompt if first parse failed ─────────────────
         if parsed is None:
-            self.log("Strategy parse failed on first attempt — retrying with strict prompt", "warning")
+            self.log(
+                f"Strategy parse failed on first attempt (failure #{self._ai_consecutive_failures + 1}) "
+                "— retrying with strict prompt", "warning"
+            )
             retry_prompt = (
-                "Return ONLY valid JSON. No markdown, no code blocks, "
-                "no newlines inside string values.\n"
-                "Format exactly (fill in real values):\n"
+                "Return ONLY raw JSON. No markdown. No backticks. No explanation.\n"
+                "Start with { and end with }.\n"
+                "Required format (fill in real values):\n"
                 "{\"setups\":[{\"symbol\":\"TICKER\",\"direction\":\"long\","
                 "\"entry_price\":0.0,\"confidence\":0.85,\"grade\":\"A\","
                 "\"timeframe\":\"intraday\",\"thesis\":\"reason\","
@@ -622,16 +643,22 @@ class StrategyAgent(BaseBot):
                  {"role": "user", "content": retry_prompt}],
                 prefer="sonnet",
                 max_tokens=600,
+                timeout=10.0,
             )
             parsed = self._parse_json_safe(raw2) if raw2 else None
 
         # ── Fallback: build setup from top momentum signal ────────────────────
         if parsed is None:
-            self.log("Strategy parse failed after retry — using momentum fallback", "warning")
+            self._ai_consecutive_failures += 1
+            self.log(
+                f"Strategy parse failed after retry (failure #{self._ai_consecutive_failures}) "
+                "— using momentum fallback", "warning"
+            )
             fallback = self._momentum_fallback_setups()
             return fallback, "neutral", "parse_error_momentum_fallback"
 
         try:
+            self._ai_consecutive_failures = 0   # reset streak — parse succeeded
             setups = parsed.get("setups", [])
 
             # ALWAYS overwrite stop/take-profit and position size — never trust Claude's values

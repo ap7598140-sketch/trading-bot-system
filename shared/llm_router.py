@@ -56,12 +56,13 @@ class LLMRouter:
         prefer:     str = "haiku",   # "haiku" | "sonnet"
         max_tokens: int = 300,
         cache_key:  str = "",        # only honoured for Haiku calls
+        timeout:    float = 10.0,    # hard wall-clock limit per call (seconds)
     ) -> str:
         """
         Execute an LLM call.
         - Sonnet: always fires a fresh API call; cache_key is ignored.
         - Haiku: uses in-memory cache when cache_key is provided (TTL 10 min).
-        Never raises — returns "" on error.
+        Never raises — returns "" on error or timeout.
         """
         model = Models.SONNET if prefer == "sonnet" else Models.HAIKU
 
@@ -72,16 +73,19 @@ class LLMRouter:
                 return hit
 
         try:
-            resp = await asyncio.get_event_loop().run_in_executor(
+            future = asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self._client.messages.create(
                     model=model, max_tokens=max_tokens, messages=messages
                 ),
             )
+            resp = await asyncio.wait_for(future, timeout=timeout)
             # Guard against empty content list or whitespace-only responses
             if not resp.content:
                 return ""
             text = resp.content[0].text.strip()
+        except asyncio.TimeoutError:
+            return ""
         except Exception:
             return ""
 

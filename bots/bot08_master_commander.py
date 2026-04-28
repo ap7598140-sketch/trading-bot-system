@@ -101,7 +101,8 @@ class MasterCommander(BaseBot):
         self._wins_today          = 0    # positions closed at take-profit
         self._losses_today        = 0    # positions closed at stop-loss
         self._milestone_sent: set[str] = set()  # tracks which daily milestones have been alerted
-        self._profit_locked     = False   # True when +$50 daily profit target hit
+        self._profit_locked          = False   # True when +$50 daily profit target hit
+        self._ai_consecutive_failures = 0      # consecutive JSON parse failures from _ai_command_review
 
         # Aggregated signals
         self._risk_stats:      dict = {}
@@ -390,13 +391,34 @@ class MasterCommander(BaseBot):
         Sonnet reviews live system state and issues commands.
         Never cached — each review reflects the current portfolio/P&L.
         Only called when market is open and data feeds have content.
+        Never freezes: 10 s timeout + consecutive-failure bypass after 3 failures.
         """
+        DEFAULT = {
+            "trading_allowed": not self._system_halted,
+            "session_action":  "continue",
+            "risk_level":      "medium",
+            "alert_operator":  False,
+            "operator_message": "",
+            "notes":           "",
+        }
+
+        # After 3 consecutive parse failures skip Claude — use safe defaults
+        if self._ai_consecutive_failures >= 3:
+            self.log(
+                f"AI review bypassed: {self._ai_consecutive_failures} consecutive parse failures "
+                "— using safe defaults to protect trading cycle", "warning"
+            )
+            return DEFAULT
+
         summary = LLMRouter.compress_system_state(system_state)
 
         prompt = (
-            "Commander. Only halt if pnl<-3%. Ignore empty data feeds.\n"
-            f"{summary}\n"
-            "JSON:{\"trading_allowed\":true,\"risk_level\":\"low\","
+            "Return ONLY raw JSON. No markdown. No backticks. No headers. No explanation.\n"
+            "Start your response with { and end with }.\n\n"
+            f"System state: {summary}\n\n"
+            "Only recommend halt if daily pnl < -3%. Ignore empty data feeds.\n"
+            "Required JSON (fill in real values, keep all keys):\n"
+            "{\"trading_allowed\":true,\"risk_level\":\"low\","
             "\"session_action\":\"continue\",\"alert_operator\":false,"
             "\"operator_message\":\"\",\"notes\":\"\"}"
         )
@@ -405,22 +427,23 @@ class MasterCommander(BaseBot):
             [{"role": "user", "content": prompt}],
             prefer="sonnet",
             max_tokens=150,
+            timeout=10.0,
         )
         if not raw:
-            return {"trading_allowed": not self._system_halted,
-                    "session_action": "continue", "risk_level": "medium", "notes": ""}
+            self._ai_consecutive_failures += 1
+            self.log(
+                f"AI review empty/timeout (failure #{self._ai_consecutive_failures})", "warning"
+            )
+            return DEFAULT
+
         try:
-            # Strip markdown code fences (handles ```json, ```, ``` alone)
+            # Strip markdown fences, illegal control chars, JS comments, trailing commas
             text = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
-            # Strip illegal control characters (\x00-\x08, \x0b, \x0c, \x0e-\x1f)
             text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
-            # Strip JS-style comments and trailing commas
             text = re.sub(r"//[^\n]*", "", text)
             text = re.sub(r",\s*([}\]])", r"\1", text)
 
-            # Extract outermost { ... } block — raise if nothing found so the
-            # except block can return the safe default instead of passing an
-            # empty or prose string to json.loads
+            # Extract outermost { ... } block
             start = text.find("{")
             if start == -1:
                 raise ValueError(f"no JSON object in response: {text[:80]!r}")
@@ -435,15 +458,18 @@ class MasterCommander(BaseBot):
                         depth -= 1
                         if depth == 0: end = i; break
             if end == -1:
-                raise ValueError(f"unterminated JSON object in response: {text[:80]!r}")
+                raise ValueError(f"unterminated JSON object: {text[:80]!r}")
             text = text[start:end + 1]
 
-            # strict=False tolerates any surviving control chars inside strings
-            return json.loads(text, strict=False)
+            result = json.loads(text, strict=False)
+            self._ai_consecutive_failures = 0   # reset streak on success
+            return result
         except Exception as e:
-            self.log(f"AI review parse error: {e}", "warning")
-            return {"trading_allowed": not self._system_halted,
-                    "session_action": "continue", "risk_level": "medium", "notes": ""}
+            self._ai_consecutive_failures += 1
+            self.log(
+                f"AI review parse error (failure #{self._ai_consecutive_failures}): {e}", "warning"
+            )
+            return DEFAULT
 
     # ── Profit milestones ──────────────────────────────────────────────────────
 
@@ -1116,13 +1142,14 @@ class MasterCommander(BaseBot):
                     self._system_halted  = False
                     self._halt_published = False
                     self.log("Market opened – trading resumed")
-                self._real_trades_today   = 0
-                self._halt_ignored_logged = False
-                self._consecutive_losses  = 0
-                self._wins_today          = 0
-                self._losses_today        = 0
-                self._profit_locked       = False
-                self._milestone_sent.clear()   # reset daily profit milestones
+                self._real_trades_today       = 0
+                self._halt_ignored_logged     = False
+                self._consecutive_losses      = 0
+                self._wins_today              = 0
+                self._losses_today            = 0
+                self._profit_locked           = False
+                self._ai_consecutive_failures = 0   # re-enable Claude each morning
+                self._milestone_sent.clear()        # reset daily profit milestones
                 # Ensure gate is open at market open
                 await self.save_state("market_gate", {
                     "allow_new_trades": True,
