@@ -582,8 +582,6 @@ class StrategyAgent(BaseBot):
         # Pass full signal context — Claude needs the actual price to generate a
         # valid entry_price. Never compress: stripping price_context caused stale prices.
         prompt = (
-            "Return ONLY raw JSON. No markdown. No backticks. No headers. No explanation.\n"
-            "Start your response with { and end with }.\n\n"
             f"You are an expert intraday trader. Analyse the signals below and output 1-3 high-conviction trade setups.\n"
             f"Rules:\n"
             f"  - Only Grade A (${RiskConfig.GRADE_A_POSITION_USD:,.0f} position) or Grade B (${RiskConfig.GRADE_B_POSITION_USD:,.0f} position) signals\n"
@@ -596,7 +594,7 @@ class StrategyAgent(BaseBot):
             + f"  - {regime_tag}\n"
             + (f"  - {bear_note}\n" if bear_note else "")
             + f"\nFull market signals:\n{LLMRouter.j(signals)}\n\n"
-            "Required JSON format (fill in real values, start with {, end with }):\n"
+            "Required JSON (fill in real values):\n"
             "{\"setups\":[{\"symbol\":\"TICKER\",\"direction\":\"long\","
             "\"entry_price\":0.0,\"confidence\":0.85,\"grade\":\"A\","
             "\"timeframe\":\"intraday\",\"thesis\":\"one sentence why\","
@@ -628,8 +626,6 @@ class StrategyAgent(BaseBot):
                 "— retrying with strict prompt", "warning"
             )
             retry_prompt = (
-                "Return ONLY raw JSON. No markdown. No backticks. No explanation.\n"
-                "Start with { and end with }.\n"
                 "Required format (fill in real values):\n"
                 "{\"setups\":[{\"symbol\":\"TICKER\",\"direction\":\"long\","
                 "\"entry_price\":0.0,\"confidence\":0.85,\"grade\":\"A\","

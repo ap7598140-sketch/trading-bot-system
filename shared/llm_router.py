@@ -29,6 +29,13 @@ from config import Models
 
 NEWS_CACHE_TTL = 600   # 10 min — only for news/data Haiku calls
 
+# System prompt injected on every call — prevents Claude returning prose/markdown
+_JSON_SYSTEM = (
+    "Respond with a single JSON object only. "
+    "No markdown. No backticks. No explanation. "
+    "First character must be { last must be }"
+)
+
 
 class LLMRouter:
     """
@@ -53,16 +60,19 @@ class LLMRouter:
         self,
         messages: list[dict],
         *,
-        prefer:     str = "haiku",   # "haiku" | "sonnet"
+        prefer:     str = "haiku",       # "haiku" | "sonnet"
         max_tokens: int = 300,
-        cache_key:  str = "",        # only honoured for Haiku calls
-        timeout:    float = 10.0,    # hard wall-clock limit per call (seconds)
+        cache_key:  str = "",            # only honoured for Haiku calls
+        timeout:    float = 10.0,        # hard wall-clock limit per call (seconds)
+        system:     str = _JSON_SYSTEM,  # system prompt; pass "" to omit
     ) -> str:
         """
         Execute an LLM call.
         - Sonnet: always fires a fresh API call; cache_key is ignored.
         - Haiku: uses in-memory cache when cache_key is provided (TTL 10 min).
+        - system prompt defaults to _JSON_SYSTEM on every call.
         Never raises — returns "" on error or timeout.
+        Response is pre-processed: markdown fences stripped, JSON extracted.
         """
         model = Models.SONNET if prefer == "sonnet" else Models.HAIKU
 
@@ -72,12 +82,15 @@ class LLMRouter:
             if hit is not None:
                 return hit
 
+        # Build create kwargs — only add system when non-empty
+        create_kwargs: dict = {"model": model, "max_tokens": max_tokens, "messages": messages}
+        if system:
+            create_kwargs["system"] = system
+
         try:
             future = asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self._client.messages.create(
-                    model=model, max_tokens=max_tokens, messages=messages
-                ),
+                lambda: self._client.messages.create(**create_kwargs),
             )
             resp = await asyncio.wait_for(future, timeout=timeout)
             # Guard against empty content list or whitespace-only responses
@@ -88,6 +101,18 @@ class LLMRouter:
             return ""
         except Exception:
             return ""
+
+        # ── Normalise: strip markdown fences and extract JSON object ──────────
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        text = text.strip()
+
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            text = text[start:end]
 
         if model == Models.HAIKU and cache_key:
             self._cache_set(cache_key, text)

@@ -413,8 +413,6 @@ class MasterCommander(BaseBot):
         summary = LLMRouter.compress_system_state(system_state)
 
         prompt = (
-            "Return ONLY raw JSON. No markdown. No backticks. No headers. No explanation.\n"
-            "Start your response with { and end with }.\n\n"
             f"System state: {summary}\n\n"
             "Only recommend halt if daily pnl < -3%. Ignore empty data feeds.\n"
             "Required JSON (fill in real values, keep all keys):\n"
