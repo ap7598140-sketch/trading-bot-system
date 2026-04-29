@@ -108,7 +108,14 @@ class StrategyAgent(BaseBot):
         sym = data.get("symbol")
         if sym:
             self._market_data[sym] = data
-        # Trigger a decision cycle at most once per DECISION_DEBOUNCE seconds
+        # Only trigger a cycle when there are actual signals to analyse.
+        # Firing on empty buffers consumes the debounce window before bot03's
+        # signals arrive, then blocks the momentum-triggered cycle for 120 s.
+        has_signals = bool(
+            self._momentum_signals or self._news_signals or self._options_signals
+        )
+        if not has_signals:
+            return
         now = datetime.now(timezone.utc)
         if (self._last_decision is None or
                 (now - self._last_decision).total_seconds() >= DECISION_DEBOUNCE):
@@ -557,9 +564,10 @@ class StrategyAgent(BaseBot):
     # ── AI strategy generation ─────────────────────────────────────────────────
 
     async def _generate_trade_setups(self, signals: dict) -> list[dict]:
-        """Use Sonnet with full signal context to synthesise trade setups.
-        Never cached — every call is fresh so prices are always current.
-        Never freezes: 10 s timeout + consecutive-failure bypass after 3 failures."""
+        """Synthesise trade setups from live signals.
+        Primary model: Haiku (fast, 30 s timeout).
+        Retry model:   Sonnet (higher quality if Haiku parse fails).
+        Never freezes: consecutive-failure bypass after 3 failures."""
 
         sl_pct, tp_pct = self._regime_sl_tp()
 
@@ -603,27 +611,41 @@ class StrategyAgent(BaseBot):
             "\"market_bias\":\"neutral\",\"notes\":\"\"}"
         )
 
+        # ── Primary: Haiku (fast, avoids Sonnet timeout issues) ─────────────────
         raw = await self._router.call(
             [{"role": "user", "content": prompt}],
-            prefer="sonnet",
+            prefer="haiku",
             max_tokens=800,
-            timeout=10.0,
+            timeout=30.0,
         )
         if not raw:
             self._ai_consecutive_failures += 1
             self.log(
-                f"Strategy AI empty/timeout (failure #{self._ai_consecutive_failures}) "
+                f"Haiku empty/timeout (failure #{self._ai_consecutive_failures}) "
+                "— trying Sonnet", "warning"
+            )
+            # One Sonnet attempt before giving up on AI entirely
+            raw = await self._router.call(
+                [{"role": "user", "content": prompt}],
+                prefer="sonnet",
+                max_tokens=800,
+                timeout=30.0,
+            )
+        if not raw:
+            self._ai_consecutive_failures += 1
+            self.log(
+                f"Sonnet also empty/timeout (failure #{self._ai_consecutive_failures}) "
                 "— using momentum fallback", "warning"
             )
             return self._momentum_fallback_setups(), "neutral", "ai_timeout_momentum_fallback"
 
         parsed = self._parse_json_safe(raw)
 
-        # ── Retry with a strict prompt if first parse failed ─────────────────
+        # ── Retry with Sonnet if Haiku parse failed ───────────────────────────
         if parsed is None:
             self.log(
-                f"Strategy parse failed on first attempt (failure #{self._ai_consecutive_failures + 1}) "
-                "— retrying with strict prompt", "warning"
+                f"Haiku parse failed (failure #{self._ai_consecutive_failures + 1}) "
+                "— retrying with Sonnet", "warning"
             )
             retry_prompt = (
                 "Required format (fill in real values):\n"
@@ -639,7 +661,7 @@ class StrategyAgent(BaseBot):
                  {"role": "user", "content": retry_prompt}],
                 prefer="sonnet",
                 max_tokens=600,
-                timeout=10.0,
+                timeout=30.0,
             )
             parsed = self._parse_json_safe(raw2) if raw2 else None
 
@@ -647,7 +669,7 @@ class StrategyAgent(BaseBot):
         if parsed is None:
             self._ai_consecutive_failures += 1
             self.log(
-                f"Strategy parse failed after retry (failure #{self._ai_consecutive_failures}) "
+                f"Parse failed after Haiku+Sonnet retry (failure #{self._ai_consecutive_failures}) "
                 "— using momentum fallback", "warning"
             )
             fallback = self._momentum_fallback_setups()
@@ -963,11 +985,11 @@ class StrategyAgent(BaseBot):
             "timestamp":     datetime.utcnow().isoformat(),
         }, ttl=120)
 
-        # Keep the last 5 of each buffer as carry-forward so signals that arrived
-        # during this cycle aren't silently dropped before the next run
-        self._news_signals     = self._news_signals[-5:]
-        self._momentum_signals = self._momentum_signals[-5:]
-        self._options_signals  = self._options_signals[-5:]
+        # Keep signals as carry-forward; bot03 scans every 5 min so we retain
+        # 20 momentum signals to bridge the gap between scans.
+        self._news_signals     = self._news_signals[-10:]
+        self._momentum_signals = self._momentum_signals[-20:]
+        self._options_signals  = self._options_signals[-10:]
 
         self.log(f"Cycle complete | {len(setups)} setups | bias={market_bias}")
 
