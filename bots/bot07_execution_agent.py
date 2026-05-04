@@ -45,6 +45,7 @@ class ExecutionAgent(BaseBot):
         self._profit_locked          = False   # True when +$50 daily profit target hit
         self._trades_today           = 0       # resets at market open; capped at MAX_DAILY_TRADES
         self._slow_start_trade_count = 0       # trades placed in first 30 min (9:35–10:05am ET)
+        self._traded_today:  set[str] = set()  # symbols bought today; prevents re-entry same day
         self._pending_orders: dict[str, dict] = {}    # order_id → order info
         self._executions_today: list[dict] = []
         # Position tracker for partial-close / trailing-stop / compound logic
@@ -157,6 +158,11 @@ class ExecutionAgent(BaseBot):
             return
 
         side = "buy" if direction == "long" else "sell"
+
+        # Duplicate trade prevention — one entry per symbol per day
+        if side == "buy" and sym in self._traded_today:
+            self.log(f"Skipping {sym} — already traded today", "warning")
+            return
 
         # Only open new buy positions inside the all-day trading window
         if side == "buy":
@@ -318,6 +324,8 @@ class ExecutionAgent(BaseBot):
 
             self._executions_today.append(execution_record)
             self._trades_today += 1
+            if side == "buy":
+                self._traded_today.add(sym)          # block re-entry today
             if side == "buy" and self._in_slow_start():
                 self._slow_start_trade_count += 1
             if result.get("id"):
@@ -636,6 +644,7 @@ class ExecutionAgent(BaseBot):
             self._trades_today           = 0
             self._profit_locked          = False
             self._slow_start_trade_count = 0
+            self._traded_today.clear()
             self.log("Market open — buy orders re-enabled, daily trade counter reset")
 
     # ── EOD order cancel ───────────────────────────────────────────────────────

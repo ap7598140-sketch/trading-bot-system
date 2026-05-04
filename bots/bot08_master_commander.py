@@ -1235,28 +1235,42 @@ class MasterCommander(BaseBot):
             if not data_available:
                 self.log("Data feeds empty — skipping AI review, will retry next cycle", "warning")
             else:
-                decision = await self._ai_command_review(system_state)
+                try:
+                    decision = await self._ai_command_review(system_state)
+                except Exception as e:
+                    self.log(f"AI review error: {e} — continuing with defaults", "warning")
+                    decision = {
+                        "trading_allowed":  True,
+                        "session_action":   "continue",
+                        "risk_level":       "medium",
+                        "alert_operator":   False,
+                        "operator_message": "",
+                        "notes":            "",
+                    }
 
-                # AI may only trigger close_all (not halt/pause — those are hard-coded above)
-                session_action = decision.get("session_action", "continue")
-                if session_action == "close_all":
-                    self.log("AI commanded: close all positions", "warning")
-                    loop = asyncio.get_event_loop()
-                    try:
-                        await loop.run_in_executor(None, self.alpaca.close_all_positions)
-                    except Exception as e:
-                        self.log(f"Close all failed: {e}", "error")
+                try:
+                    # AI may only trigger close_all (not halt/pause — those are hard-coded above)
+                    session_action = decision.get("session_action", "continue")
+                    if session_action == "close_all":
+                        self.log("AI commanded: close all positions", "warning")
+                        loop = asyncio.get_event_loop()
+                        try:
+                            await loop.run_in_executor(None, self.alpaca.close_all_positions)
+                        except Exception as e:
+                            self.log(f"Close all failed: {e}", "error")
 
-                if decision.get("alert_operator") and decision.get("operator_message"):
-                    await self.publish(RedisConfig.CHANNEL_ALERTS, {
-                        "type":       "operator_alert",
-                        "message":    decision["operator_message"],
-                        "risk_level": decision.get("risk_level", "medium"),
-                    })
+                    if decision.get("alert_operator") and decision.get("operator_message"):
+                        await self.publish(RedisConfig.CHANNEL_ALERTS, {
+                            "type":       "operator_alert",
+                            "message":    decision["operator_message"],
+                            "risk_level": decision.get("risk_level", "medium"),
+                        })
 
-                risk_level = decision.get("risk_level", "medium")
-                system_state["commander_risk_level"] = risk_level
-                system_state["commander_notes"]      = decision.get("notes", "")
+                    risk_level = decision.get("risk_level", "medium")
+                    system_state["commander_risk_level"] = risk_level
+                    system_state["commander_notes"]      = decision.get("notes", "")
+                except Exception as e:
+                    self.log(f"AI decision processing error: {e} — trading continues", "warning")
 
         # Save full dashboard state (refresh task also writes every 60 s)
         await self.save_state("dashboard", system_state, ttl=90)
