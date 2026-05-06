@@ -21,6 +21,7 @@ from config import Models, RedisConfig, RiskConfig, AnthropicConfig, UniverseCon
 from shared.base_bot import BaseBot
 from shared.alpaca_client import AlpacaClient
 from shared.llm_router import LLMRouter
+from shared.mtf_analyzer import MultiTimeframeAnalyzer
 
 MARKET_TZ = pytz.timezone("America/New_York")
 
@@ -46,6 +47,7 @@ class StrategyAgent(BaseBot):
             save_fn=self.save_state,
             get_fn=self.bus.get_state,
         )
+        self._mtf = MultiTimeframeAnalyzer(self.alpaca)
 
         # Signal buffers (reset each decision cycle)
         self._market_data: dict[str, dict]  = {}
@@ -278,11 +280,13 @@ class StrategyAgent(BaseBot):
         return best
 
     def _grade_position_size(self, grade: str) -> float:
-        """Map momentum grade → base position size in USD."""
+        """Map grade → base position size in USD (MTF grades: A+=6, A=5, B=4, C=3)."""
         if grade in ("A", "A+"):
             return RiskConfig.GRADE_A_POSITION_USD   # $3,000
         if grade == "B":
             return RiskConfig.GRADE_B_POSITION_USD   # $2,000
+        if grade == "C":
+            return RiskConfig.GRADE_C_POSITION_USD   # $1,000
         return RiskConfig.MIN_SINGLE_POSITION_USD    # $1,500 floor
 
     def _safe_position_size(self, entry, stop_loss, grade: str = "") -> float:
@@ -903,6 +907,70 @@ class StrategyAgent(BaseBot):
                 "Will retry when bot03 publishes next scan or market data arrives."
             )
             return
+
+        # ── Multi-Timeframe Analysis ───────────────────────────────────────────
+        # Run MTF scoring on all momentum candidates; skip symbols with < 3
+        # criteria (Grade D) to prevent entering on weak multi-TF alignment.
+        if signals["momentum"]:
+            candidates = list({m["symbol"] for m in signals["momentum"] if m.get("symbol")})
+            current_prices = {
+                sym: self._market_data[sym]["price"]
+                for sym in candidates
+                if sym in self._market_data and self._market_data[sym].get("price")
+            }
+            try:
+                mtf_results = await self._mtf.analyze_batch(candidates, current_prices)
+            except Exception as e:
+                self.log(f"MTF analysis error: {e} — proceeding without MTF filter", "warning")
+                mtf_results = {}
+
+            if mtf_results:
+                pre_filter = len(signals["momentum"])
+                signals["momentum"] = [
+                    m for m in signals["momentum"]
+                    if mtf_results.get(m.get("symbol", ""), {}).get(
+                        "criteria_count", RiskConfig.MTF_MIN_CRITERIA
+                    ) >= RiskConfig.MTF_MIN_CRITERIA
+                ]
+                # Attach MTF grade to each signal so Claude + winner criteria can use it
+                for m in signals["momentum"]:
+                    mtf = mtf_results.get(m.get("symbol", ""), {})
+                    m["mtf_grade"]      = mtf.get("grade", "")
+                    m["mtf_criteria"]   = mtf.get("criteria_count", 0)
+                    m["fvg_active"]     = mtf.get("fvg_active", False)
+                    m["asp_setup"]      = mtf.get("asp_setup", False)
+                    m["trend_summary"]  = (
+                        f"D:{mtf.get('trend_daily','?')} "
+                        f"4H:{mtf.get('trend_4h','?')} "
+                        f"1H:{mtf.get('trend_1h','?')} "
+                        f"15M:{mtf.get('trend_15m','?')}"
+                    )
+                    # Override grade with MTF grade when it is stronger
+                    if mtf.get("grade") and not m.get("grade"):
+                        m["grade"] = mtf["grade"]
+
+                signals["mtf_analysis"] = {
+                    sym: {
+                        "grade":       v.get("grade"),
+                        "criteria":    v.get("criteria_count"),
+                        "trends":      f"D:{v.get('trend_daily','?')} 4H:{v.get('trend_4h','?')} 1H:{v.get('trend_1h','?')} 15M:{v.get('trend_15m','?')}",
+                        "fvg":         v.get("fvg_active"),
+                        "asp":         v.get("asp_setup"),
+                    }
+                    for sym, v in mtf_results.items()
+                }
+                self.log(
+                    f"MTF filter | {pre_filter} → {len(signals['momentum'])} signals "
+                    f"(kept ≥{RiskConfig.MTF_MIN_CRITERIA} criteria) | "
+                    f"grades={[m.get('mtf_grade') for m in signals['momentum']]}"
+                )
+                if not signals["momentum"]:
+                    self.log(
+                        "MTF filter removed all momentum signals — no symbols with "
+                        f"≥{RiskConfig.MTF_MIN_CRITERIA} aligned timeframes",
+                        "warning",
+                    )
+                    # Fall through: options/news signals may still produce setups
 
         # In bear/crash regime, inject inverse ETF data into momentum signals
         if self._current_regime in ("bear", "crash"):

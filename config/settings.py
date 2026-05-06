@@ -63,15 +63,22 @@ class RiskConfig:
     MAX_DAILY_TRADES         = 30
 
     # ── Position sizing by grade ─────────────────────────────────────────────
-    GRADE_A_POSITION_USD     = 3000.0  # Grade A signal → $3,000 position
-    GRADE_B_POSITION_USD     = 2000.0  # Grade B signal → $2,000 position
-    MIN_SINGLE_POSITION_USD  = 1500.0  # floor after regime scaling
+    GRADE_A_POSITION_USD     = 3000.0  # Grade A/A+ (5-6 MTF criteria) → $3,000
+    GRADE_B_POSITION_USD     = 2000.0  # Grade B    (4 MTF criteria)   → $2,000
+    GRADE_C_POSITION_USD     = 1000.0  # Grade C    (3 MTF criteria)   → $1,000
+    MIN_SINGLE_POSITION_USD  = 1500.0  # floor after regime scaling (non-MTF)
     MAX_SINGLE_POSITION_USD  = 3000.0  # ceiling (Grade A)
 
     # ── Stop / take-profit ────────────────────────────────────────────────────
     CONFIDENCE_THRESHOLD     = 0.70
     STOP_LOSS_PCT            = 0.015   # 1.5% → ~$45 on $3k, ~$30 on $2k
     TAKE_PROFIT_PCT          = 0.03    # 3%   → 2:1 RR
+
+    # ── MTF strategy stop / targets ───────────────────────────────────────────
+    MTF_STOP_LOSS_PCT        = 0.010   # 1%   stop below FVG low
+    MTF_TARGET1_PCT          = 0.020   # 2%   take 50% off
+    MTF_TARGET2_PCT          = 0.040   # 4%   trail remainder
+    MTF_MIN_CRITERIA         = 3       # skip symbol if < 3 MTF criteria pass
 
     # ── Partial close + trailing stop ─────────────────────────────────────────
     PARTIAL_CLOSE_TRIGGER_PCT     = 0.02    # sell 50% of position at +2%
