@@ -98,7 +98,7 @@ class RiskConfig:
     # ── Signal quality ────────────────────────────────────────────────────────
     MIN_STOCK_SCORE          = 70      # premarket score required (1-100)
     MIN_WINNER_CRITERIA      = 4       # of 6 criteria that must pass
-    VOLUME_CONFIRMATION_X    = 2.0     # require 2× average volume
+    VOLUME_CONFIRMATION_X    = 1.3     # require 1.3× average volume
     MIN_GRADE_A_PROFIT_USD   = 75.0    # minimum target $ profit for Grade A
     MIN_GRADE_B_PROFIT_USD   = 50.0    # minimum target $ profit for Grade B
     MIN_REWARD_RISK_RATIO    = 2.0     # always 2:1
